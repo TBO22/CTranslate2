@@ -19,11 +19,21 @@
 
 #define SINGLE_ARG(...) __VA_ARGS__
 #ifndef CT2_WITH_CUDA
-#  define DEVICE_DISPATCH(DEVICE, STMTS)                \
+#  ifdef CT2_WITH_MPS
+#    define DEVICE_DISPATCH(DEVICE, STMTS)              \
   switch (DEVICE) {                                     \
     UNSUPPORTED_DEVICE_CASE(Device::CUDA)               \
+    DEVICE_CASE(Device::MPS, SINGLE_ARG(STMTS))         \
     DEVICE_CASE(Device::CPU, SINGLE_ARG(STMTS))         \
   }
+#  else
+#    define DEVICE_DISPATCH(DEVICE, STMTS)              \
+  switch (DEVICE) {                                     \
+    UNSUPPORTED_DEVICE_CASE(Device::CUDA)               \
+    UNSUPPORTED_DEVICE_CASE(Device::MPS)                \
+    DEVICE_CASE(Device::CPU, SINGLE_ARG(STMTS))         \
+  }
+#  endif
 #else
 #  define DEVICE_DISPATCH(DEVICE, STMTS)                \
   switch (DEVICE) {                                     \

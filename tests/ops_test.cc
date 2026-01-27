@@ -928,8 +928,8 @@ TEST_P(OpDeviceTest, QuantizeINT8) {
   }
 
   // With rounding before cast and shift to uint8.
-  // Shift to uin8_t is not defined on CUDA
-  if (device != Device::CUDA) {
+  // Shift to uint8_t is not defined on CUDA or MPS.
+  if (device != Device::CUDA && device != Device::MPS) {
     StorageView expected_qa(a.shape(), std::vector<int8_t>{1, 90, -64, -103, -98, -1, 110, -128});
     ops::Quantize(ops::Quantize::ScaleType::GLOBAL, true, true)(a, qa, scale);
     expect_storage_eq(scale, expected_scale);
@@ -1256,6 +1256,10 @@ TEST_P(OpDeviceFPTest, Conv1DDilation) {
   const Device device = GetParam().device;
   if (device == Device::CPU)
       GTEST_SKIP() << "Dilated convolution is not implemented for CPU.";
+#ifdef CT2_WITH_MPS
+  if (device == Device::MPS)
+      GTEST_SKIP() << "Dilated convolution is not implemented for MPS.";
+#endif
   const DataType dtype = GetParam().dtype;
   const float error = GetParam().error;
   const StorageView expected({2, 4, 1}, std::vector<float>{
@@ -1322,7 +1326,7 @@ TEST_P(OpDeviceFPTest, Conv1DGroupNoBiasQuantized) {
 #endif
     const Device device = GetParam().device;
     if (device != Device::CPU)
-        GTEST_SKIP() << "Grouped quantized convolution is not implemented for CUDA.";
+        GTEST_SKIP() << "Grouped quantized convolution is not implemented for GPU.";
     const DataType dtype = GetParam().dtype;
     const float error = std::max(GetParam().error, float(3e-3));
     const StorageView expected({2, 2, 2}, std::vector<float>{
@@ -1420,5 +1424,13 @@ INSTANTIATE_TEST_SUITE_P(CUDA, OpDeviceFPTest,
                          ::testing::Values(FloatType{Device::CUDA, DataType::FLOAT32, 1e-5},
                                            FloatType{Device::CUDA, DataType::FLOAT16, 1e-2},
                                            FloatType{Device::CUDA, DataType::BFLOAT16, 4e-2}),
+                         fp_test_name);
+#endif
+#ifdef CT2_WITH_MPS
+INSTANTIATE_TEST_SUITE_P(MPS, OpDeviceTest, ::testing::Values(Device::MPS));
+INSTANTIATE_TEST_SUITE_P(MPS, OpDeviceFPTest,
+                         ::testing::Values(FloatType{Device::MPS, DataType::FLOAT32, 1e-5},
+                                           FloatType{Device::MPS, DataType::FLOAT16, 1e-2},
+                                           FloatType{Device::MPS, DataType::BFLOAT16, 4e-2}),
                          fp_test_name);
 #endif

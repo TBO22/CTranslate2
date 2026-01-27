@@ -14,6 +14,7 @@ option(WITH_OPENBLAS "Compile with OpenBLAS backend" OFF)
 option(WITH_RUY "Compile with Ruy backend" OFF)
 option(WITH_CUDA "Compile with CUDA backend" OFF)
 option(WITH_CUDNN "Compile with cuDNN backend" OFF)
+option(WITH_MPS "Compile with Apple MPS (Metal) backend for Apple Silicon" OFF)
 option(CUDA_DYNAMIC_LOADING "Dynamically load CUDA libraries at runtime" OFF)
 option(ENABLE_CPU_DISPATCH "Compile CPU kernels for multiple ISA and dispatch at runtime" ON)
 option(ENABLE_PROFILING "Compile with profiling support" OFF)
@@ -683,6 +684,34 @@ elseif(WITH_CUDNN)
   message(FATAL_ERROR "WITH_CUDNN=ON requires WITH_CUDA=ON")
 else()
   add_library(${PROJECT_NAME} ${SOURCES})
+endif()
+
+if(APPLE AND WITH_MPS)
+  if(NOT WITH_CUDA)
+    message(STATUS "Enabling MPS (Metal) backend for Apple Silicon")
+    add_definitions(-DCT2_WITH_MPS)
+    set(MPS_SOURCES
+      src/mps/utils.mm
+      src/mps/allocator.mm
+      src/mps/primitives.mm
+      src/ops/softmax_mps.cc
+      src/ops/layer_norm_mps.cc
+      src/ops/rms_norm_mps.cc
+    )
+    target_sources(${PROJECT_NAME} PRIVATE ${MPS_SOURCES})
+    find_library(METAL_LIBRARY Metal)
+    find_library(MPS_LIBRARY MetalPerformanceShaders)
+    find_library(FOUNDATION_LIBRARY Foundation)
+    find_library(COREGRAPHICS_LIBRARY CoreGraphics)
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+      ${METAL_LIBRARY}
+      ${MPS_LIBRARY}
+      ${FOUNDATION_LIBRARY}
+      ${COREGRAPHICS_LIBRARY}
+    )
+  else()
+    message(WARNING "WITH_MPS is ignored when WITH_CUDA=ON (use one GPU backend)")
+  endif()
 endif()
 
 include(GenerateExportHeader)

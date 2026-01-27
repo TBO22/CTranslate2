@@ -56,6 +56,13 @@ PYBIND11_MODULE(_ext, m)
   m.def("get_cuda_device_count", &ctranslate2::get_gpu_count,
         "Returns the number of visible GPU devices.");
 
+#ifdef CT2_WITH_MPS
+  m.def("get_mps_device_count", []() {
+          return ctranslate2::get_device_count(ctranslate2::Device::MPS);
+        },
+        "Returns the number of MPS devices (1 on Apple Silicon).");
+#endif
+
   m.def("get_supported_compute_types", &get_supported_compute_types,
         py::arg("device"),
         py::arg("device_index")=0,

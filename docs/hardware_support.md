@@ -17,6 +17,18 @@ See the [environment variables](environment_variables.md) `CT2_USE_MKL` and `CT2
 
 ## GPU
 
+### NVIDIA (CUDA)
+
 * NVIDIA GPUs with a Compute Capability greater or equal to 3.5
 
 The driver requirement depends on the CUDA version. See the [CUDA Compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/index.html) for more information.
+
+### Apple Silicon (MPS)
+
+* Apple M1/M2/M3 (and later) Macs with Metal Performance Shaders (MPS)
+
+MPS support is **optional** and must be enabled at build time. Configure with
+``-DWITH_MPS=ON`` when building on macOS (MPS is not available on Linux/Windows).
+MPS and CUDA cannot be enabled together; use one GPU backend. Build the project
+from source on an Apple Silicon Mac, then use ``device="mps"`` or ``device="auto"``
+(in which case MPS is preferred over CPU when available) in the Python API.
