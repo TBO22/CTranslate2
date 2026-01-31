@@ -717,51 +717,75 @@ if(APPLE AND WITH_MPS)
   if(NOT WITH_CUDA)
     message(STATUS "Enabling MPS (Metal) backend for Apple Silicon")
     add_definitions(-DCT2_WITH_MPS)
-    
-    # Enable Objective-C++ compilation
+
+    # Ensure Objective-C / Objective-C++
     enable_language(OBJC)
-    set_source_files_properties(
-      src/mps/utils.mm
-      src/mps/allocator.mm
-      src/mps/primitives.mm
-      src/mps/ops_stubs.mm
-      PROPERTIES LANGUAGE OBJCXX
-    )
-    
+    enable_language(OBJCXX)
+
+    # ------------------------------------------------------------------
+    # Core MPS runtime sources
+    # ------------------------------------------------------------------
     set(MPS_SOURCES
       src/mps/utils.mm
       src/mps/allocator.mm
       src/mps/primitives.mm
       src/mps/ops_stubs.mm
     )
-    target_sources(${PROJECT_NAME} PRIVATE ${MPS_SOURCES})
-    
-    # Find Metal frameworks
+
+    # ------------------------------------------------------------------
+    # MPS operator implementations
+    # ------------------------------------------------------------------
+    set(MPS_OPS_SOURCES
+      src/ops/conv1d_mps.mm
+      src/ops/mean_mps.mm
+      src/ops/rms_norm_mps.mm
+      src/ops/layer_norm_mps.mm
+    )
+
+    # Mark all MPS files as Objective-C++
+    set_source_files_properties(
+      ${MPS_SOURCES}
+      ${MPS_OPS_SOURCES}
+      PROPERTIES LANGUAGE OBJCXX
+    )
+
+    # Attach sources to target
+    target_sources(${PROJECT_NAME} PRIVATE
+      ${MPS_SOURCES}
+      ${MPS_OPS_SOURCES}
+    )
+
+    # ------------------------------------------------------------------
+    # Apple frameworks
+    # ------------------------------------------------------------------
     find_library(METAL_LIBRARY Metal REQUIRED)
     find_library(MPS_LIBRARY MetalPerformanceShaders REQUIRED)
     find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
     find_library(COREGRAPHICS_LIBRARY CoreGraphics REQUIRED)
-    
+
     message(STATUS "Found Metal: ${METAL_LIBRARY}")
-    message(STATUS "Found MPS: ${MPS_LIBRARY}")
-    
+    message(STATUS "Found MetalPerformanceShaders: ${MPS_LIBRARY}")
+
     target_link_libraries(${PROJECT_NAME} PRIVATE
       ${METAL_LIBRARY}
       ${MPS_LIBRARY}
       ${FOUNDATION_LIBRARY}
       ${COREGRAPHICS_LIBRARY}
     )
-    
-    # Ensure Objective-C++ compiler flags
+
+    # ------------------------------------------------------------------
+    # ObjC++ compile flags
+    # ------------------------------------------------------------------
     target_compile_options(${PROJECT_NAME} PRIVATE
       -fno-objc-arc
       -fPIC
     )
-    
+
   else()
-    message(WARNING "WITH_MPS is ignored when WITH_CUDA=ON (use one GPU backend)")
+    message(WARNING "WITH_MPS is ignored when WITH_CUDA=ON (use only one GPU backend)")
   endif()
 endif()
+
 
 include(GenerateExportHeader)
 generate_export_header(${PROJECT_NAME})
