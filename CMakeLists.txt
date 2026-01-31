@@ -5,7 +5,13 @@ if(POLICY CMP0091)
   cmake_policy(SET CMP0091 NEW)
 endif()
 
-project(ctranslate2)
+project(ctranslate2 C CXX)
+
+# Enable Objective-C++ for MPS support on Apple
+if(APPLE)
+  enable_language(OBJC)
+  enable_language(OBJCXX)
+endif()
 
 option(WITH_MKL "Compile with Intel MKL backend" ON)
 option(WITH_DNNL "Compile with DNNL backend" OFF)
@@ -62,11 +68,27 @@ endif(NOT CMAKE_BUILD_TYPE)
 
 # Set CXX flags.
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# CRITICAL FIX FOR MACOS/MPS: Ensure consistent C++ standard library
+# CRITICAL FIX FOR MACOS/MPS: Ensure consistent C++ standard library
 if(APPLE)
-  set(CMAKE_OSX_DEPLOYMENT_TARGET 10.13)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET 26.2)
+  
+  # Force libc++ for ALL files (C, C++, ObjC, ObjC++)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -stdlib=libc++")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+  set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -stdlib=libc++")
+  set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -stdlib=libc++")
+  
+  # Tell CMake to use libc++
+  set(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++")
+  set(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LANGUAGE_DIALECT "c++17")
+  
+  # Link with libc++
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libc++")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++")
 endif()
-
 
 # Read version from version.py
 file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/python/ctranslate2/version.py VERSION_FILE)
@@ -686,29 +708,56 @@ else()
   add_library(${PROJECT_NAME} ${SOURCES})
 endif()
 
+# Apply Apple stdlib flags after target creation
+if(APPLE AND DEFINED APPLE_STDLIB_FLAGS)
+  target_link_options(${PROJECT_NAME} PRIVATE ${APPLE_STDLIB_FLAGS})
+endif()
+
 if(APPLE AND WITH_MPS)
   if(NOT WITH_CUDA)
     message(STATUS "Enabling MPS (Metal) backend for Apple Silicon")
     add_definitions(-DCT2_WITH_MPS)
+    
+    # Enable Objective-C++ compilation
+    enable_language(OBJC)
+    set_source_files_properties(
+      src/mps/utils.mm
+      src/mps/allocator.mm
+      src/mps/primitives.mm
+      src/mps/ops_stubs.mm
+      PROPERTIES LANGUAGE OBJCXX
+    )
+    
     set(MPS_SOURCES
       src/mps/utils.mm
       src/mps/allocator.mm
       src/mps/primitives.mm
-      src/ops/softmax_mps.cc
-      src/ops/layer_norm_mps.cc
-      src/ops/rms_norm_mps.cc
+      src/mps/ops_stubs.mm
     )
     target_sources(${PROJECT_NAME} PRIVATE ${MPS_SOURCES})
-    find_library(METAL_LIBRARY Metal)
-    find_library(MPS_LIBRARY MetalPerformanceShaders)
-    find_library(FOUNDATION_LIBRARY Foundation)
-    find_library(COREGRAPHICS_LIBRARY CoreGraphics)
+    
+    # Find Metal frameworks
+    find_library(METAL_LIBRARY Metal REQUIRED)
+    find_library(MPS_LIBRARY MetalPerformanceShaders REQUIRED)
+    find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
+    find_library(COREGRAPHICS_LIBRARY CoreGraphics REQUIRED)
+    
+    message(STATUS "Found Metal: ${METAL_LIBRARY}")
+    message(STATUS "Found MPS: ${MPS_LIBRARY}")
+    
     target_link_libraries(${PROJECT_NAME} PRIVATE
       ${METAL_LIBRARY}
       ${MPS_LIBRARY}
       ${FOUNDATION_LIBRARY}
       ${COREGRAPHICS_LIBRARY}
     )
+    
+    # Ensure Objective-C++ compiler flags
+    target_compile_options(${PROJECT_NAME} PRIVATE
+      -fno-objc-arc
+      -fPIC
+    )
+    
   else()
     message(WARNING "WITH_MPS is ignored when WITH_CUDA=ON (use one GPU backend)")
   endif()
@@ -784,13 +833,11 @@ configure_file(cmake/FindNCCL.cmake
 set(ConfigPackageLocation ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME})
 
 if(BUILD_SHARED_LIBS)
-  install(EXPORT ${PROJECT_NAME}Targets
+  export(EXPORT ${PROJECT_NAME}Targets
     FILE
-      ${PROJECT_NAME}Targets.cmake
+      "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}/${PROJECT_NAME}Targets.cmake"
     NAMESPACE
       CTranslate2::
-    DESTINATION
-      ${ConfigPackageLocation}
   )
 endif()
 
