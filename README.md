@@ -60,6 +60,52 @@ See the [documentation](https://opennmt.net/CTranslate2) for more information an
 
 If you have an AMD ROCm GPU, we provide specific Python wheels on the [releases page](https://github.com/OpenNMT/CTranslate2/releases/).
 
+### Apple Silicon MPS backend (experimental)
+
+This fork includes a native Metal/MPS backend for Apple Silicon Macs. It is
+currently built from source and selected with `device="mps"`:
+
+```bash
+cmake -S . -B build-mps \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWITH_MPS=ON \
+  -DWITH_ACCELERATE=ON \
+  -DWITH_MKL=OFF \
+  -DOPENMP_RUNTIME=NONE
+cmake --build build-mps -j
+```
+
+The backend supports FP32, FP16, BF16, and the `int8_float32`,
+`int8_float16`, and `int8_bfloat16` hybrid compute types. BF16 values are
+stored in BF16 while GEMM and reduction accumulation use FP32. The INT8 path
+uses signed INT8 matrices, INT32 accumulation, per-row activation scales, and
+a fused dequantization/output kernel. Query the exact runtime capabilities
+with:
+
+```python
+import ctranslate2
+
+print(ctranslate2.get_supported_compute_types("mps"))
+translator = ctranslate2.Translator(model_path,
+                                    device="mps",
+                                    compute_type="float16")
+```
+
+FP16 is the recommended and `auto` compute type for MPS. INT8 reduces stored
+weight size but is not necessarily faster on Apple GPUs, particularly for
+batch-size-1 decoding. The backend also keeps decoding operations such as
+small TopK/argmax, TopP masking, multinomial/Gumbel sampling, ALiBi, median
+filtering, and quantized or dilated Conv1D on the GPU.
+
+Current MPS limitations include FlashAttention, AWQ INT4, INT16 GEMM,
+distributed collectives, and packed/shifted-u8 INT8 GEMM. GPU TopP currently
+supports up to 1024 classes, and the optimized small TopK path supports
+`k = 1, 2, 4, 8`. Metal kernels are compiled on first use, so performance
+measurements should include warmup runs. MPS cannot be enabled together with
+CUDA or HIP in one build. See [hardware support](docs/hardware_support.md),
+[quantization](docs/quantization.md), and [installation](docs/installation.md)
+for details.
+
 ## Web Server
 
 [ctranslate2-web-server](https://github.com/jordimas/ctranslate2-web-server) is a web server built on top of CTranslate2 that exposes an OpenAI-compatible REST API, making it easy to integrate CTranslate2 models into applications that already support the OpenAI API.
