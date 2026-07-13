@@ -222,43 +222,57 @@ measurements should include warmup runs. See [hardware support](docs/hardware_su
 [quantization](docs/quantization.md), and [installation](docs/installation.md)
 for additional details.
 
-### How I used Codex and GPT-5.6
+### My research, and where Codex and GPT-5.6 helped
 
-I started this MPS port about six months before the hackathon. I had some of
-the backend and kernels in place, but it was still slower than the CPU and a
-normal translation could suddenly stop with an error such as `MPS Gather not
-implemented`. By the time I returned to it, my fork was also 31 commits behind
-CTranslate2 upstream.
+I started this port about six months before the hackathon, and most of the
+research behind it was work I had already done myself. I spent months reading
+Apple's MLX Metal backend, especially its matmul, matvec, command submission,
+tiling, and SIMD-group code. I compared that with the approaches used by
+GGML/llama.cpp and PyTorch MPS, then compared all of them with CTranslate2's
+CUDA backend and its own operator and tensor conventions.
 
-I used Codex with GPT-5.6 directly inside the repository. Most of the time it
-felt like pair programming: I gave it a real crash, incorrect translation, or
-benchmark result, and it searched through the C++, CUDA, Objective-C++, and
-Metal code to find the path involved. We would make one change, compile it,
-run the tests, and then try the actual Roman Pashto model again.
+Those implementations solve different problems. MLX was designed around
+Apple hardware from the beginning. GGML is heavily shaped by quantized LLM
+decoding and its own weight layouts. PyTorch MPS has to provide broad framework
+coverage. CUDA has mature libraries, streams, and a more explicit device-memory
+model. I could not just copy one of them into CTranslate2. I had to understand
+which ideas made sense for CTranslate2's `StorageView`, primitives, model
+loading, weight layouts, and autoregressive search.
 
-Some of the work Codex helped me finish included the persistent Metal command
-stream, the batch-size-1 GEMV path, Gather and the other missing tensor
-operations, GPU TopK, BF16 and INT8 support, quantized Conv1D, profiling tools,
-and the large upstream merge. It also handled a lot of the repetitive work:
-adding tests, checking odd tensor shapes, rebuilding the Python extension, and
-fixing CI after the code was pushed.
+I also spent a lot of time understanding unified memory. Apple Silicon lets
+the CPU and GPU use the same physical memory, but that does not make execution
+automatically synchronized. The CPU can still read data before the GPU has
+finished writing it. That distinction shaped the allocator, buffer registry,
+persistent command stream, and every place where the host genuinely needs a
+result back from Metal.
 
-Not every idea was a win. We tested command-buffer limits of 16, 32, 64, and
-128, and 16 was the fastest. We compared the custom GEMV with the general
-matrix path. INT8 worked, but on my M1 it was slower than FP16, so FP16 remains
-the automatic default. Those results came from running the code, not from
-assuming that an optimization must be faster.
+By the time I brought Codex and GPT-5.6 into the project, I was not starting
+from a blank prompt. I already had the backend direction, early kernels, and a
+real Roman Pashto model exposing the problems. What I needed was help turning
+that research into a complete integration without spending another six months
+moving through a large C++ codebase one file at a time.
 
-The biggest lesson came when MPS appeared to be more than twice as fast but
-started producing repeated, random-looking words. I did not count that as a
-speedup. I kept working with Codex until the output was stable and correct,
-then reported the lower but honest 1.64x result.
+I used Codex directly inside the repository as a pair programmer. I would give
+it a specific failure, a trace, or a benchmark result. It helped follow the
+call path across C++, CUDA, Objective-C++, and Metal, implement the next piece,
+compile it, add tests, and run the model again. This was especially useful for
+finishing missing operations such as Gather, extending the test matrix to odd
+shapes and batch strides, rebuilding the Python extension, resolving the
+31-commit upstream gap, and cleaning up CI and documentation.
 
-Codex and GPT-5.6 wrote and reviewed a meaningful part of the implementation,
-but I chose what to build, tested it on my own Mac and models, checked the
-translations, and decided which changes were good enough to keep. This was not
-a one-prompt project. It was six months of unfinished work completed through a
-very practical back-and-forth between me and Codex.
+The optimization decisions still came from research and measurement on my
+machine. I tested command-buffer limits of 16, 32, 64, and 128. I compared the
+custom GEMV with the general matrix path. I found that INT8 worked but was
+slower than FP16 on my M1, so I kept FP16 as the automatic default. When an
+early run appeared more than twice as fast but produced repeated, corrupted
+words, I rejected that number and kept debugging until the translation was
+stable.
+
+The fairest description is that I researched the architecture, chose the
+direction, and validated the result on my own hardware and models. Codex and
+GPT-5.6 helped me implement, debug, test, and finish that work much faster.
+This project came from my Metal research; Codex helped me finally turn it into
+a working CTranslate2 backend.
 
 ## Web Server
 
