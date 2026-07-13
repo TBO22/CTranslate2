@@ -6,6 +6,14 @@ CTranslate2 is a C++ and Python library for efficient inference with Transformer
 
 The project implements a custom runtime that applies many performance optimization techniques such as weights quantization, layers fusion, batch reordering, etc., to [accelerate and reduce the memory usage](#benchmarks) of Transformer models on CPU and GPU.
 
+> [!NOTE]
+> This fork is the home of **MetalTranslate**, a native Apple Metal/MPS backend
+> for CTranslate2 built for the Codex hackathon. It enables correct, private,
+> on-device Transformer inference on Apple Silicon and reached **1.64x the
+> performance of the optimized CPU backend** on the correctness-validated
+> Marian translation workload described below. Jump to the
+> [Apple Silicon setup guide](#apple-silicon-mps-backend-experimental) to try it.
+
 The following model types are currently supported:
 
 * Encoder-decoder models: Transformer base/big, M2M-100, NLLB, BART, mBART, Pegasus, T5, Whisper, T5Gemma, T5Gemma2, MADLAD-400
@@ -62,49 +70,193 @@ If you have an AMD ROCm GPU, we provide specific Python wheels on the [releases 
 
 ### Apple Silicon MPS backend (experimental)
 
-This fork includes a native Metal/MPS backend for Apple Silicon Macs. It is
-currently built from source and selected with `device="mps"`:
+MetalTranslate is implemented directly inside the CTranslate2 runtime. It is
+not a wrapper around PyTorch: model layers dispatch through CTranslate2's C++
+operator system into Objective-C++ and Metal kernels. The backend includes a
+persistent asynchronous command stream, decode-specific FP16 GEMV, tiled and
+batched GEMM, GPU search and sampling, reductions, layout operations, and
+quantized execution.
+
+The MPS build is currently source-only and requires:
+
+* An Apple Silicon Mac running macOS 11 or newer
+* Xcode Command Line Tools (`xcode-select --install`)
+* CMake and a C++17 compiler
+* Python 3.9 or newer for the optional Python API
+
+#### 1. Clone and create a Python environment
+
+```bash
+git clone https://github.com/TBO22/CTranslate2.git
+cd CTranslate2
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+#### 2. Build and install the C++ library
 
 ```bash
 cmake -S . -B build-mps \
   -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=ON \
   -DWITH_MPS=ON \
   -DWITH_ACCELERATE=ON \
   -DWITH_MKL=OFF \
   -DOPENMP_RUNTIME=NONE
-cmake --build build-mps -j
+cmake --build build-mps -j 4
+cmake --install build-mps --prefix "$PWD/install-mps"
 ```
+
+`WITH_MPS` cannot be combined with CUDA or HIP in the same build.
+
+#### 3. Install the Python extension
+
+The `CTRANSLATE2_ROOT` value makes the extension compile and link against the
+MPS-enabled library that was just installed. `ARCHFLAGS` prevents an invalid
+x86_64 slice from being added to the native Apple Silicon extension.
+
+```bash
+cd python
+python -m pip install -r install_requirements.txt
+
+export CTRANSLATE2_ROOT="$(cd ../install-mps && pwd)"
+export ARCHFLAGS="-arch arm64"
+python -m pip install -e .
+cd ..
+```
+
+Verify the installation:
+
+```bash
+python -c 'import ctranslate2; print(ctranslate2.get_mps_device_count()); print(ctranslate2.get_supported_compute_types("mps"))'
+```
+
+On a supported Mac, the first value should be at least `1`. The compute-type
+list should include `float32`, `float16`, `bfloat16`, and the INT8 hybrid modes.
+
+#### 4. Run inference
+
+```python
+import ctranslate2
+
+translator = ctranslate2.Translator(
+    "path/to/converted/model",
+    device="mps",
+    compute_type="float16",
+)
+
+results = translator.translate_batch([["▁Hello", "▁world", "!"]])
+print(results[0].hypotheses[0])
+```
+
+FP16 is the recommended compute type and is selected by `compute_type="auto"`
+on MPS. INT8 reduces model weight size, but is not necessarily faster on Apple
+GPUs, particularly during batch-size-1 decoding.
+
+#### 5. Run the MPS correctness tests
+
+Metal API validation is useful during development because it catches invalid
+resource use and encoder mistakes:
+
+```bash
+MTL_DEBUG_LAYER=1 CT2_MPS_MAX_OPS=16 \
+  ./build-mps/tests/ctranslate2_test tests/data \
+  --gtest_filter='MPS/*:MPSBackendTest.*:TranslatorTest.MPS*'
+```
+
+The final validation run passed **175 of 175 MPS tests**, including
+CPU-versus-MPS translation, FP32/FP16/BF16 operators, INT8 quantization,
+batched GEMM, TopK, sampling, and quantized grouped Conv1D. A separate
+CPU-only build passed 190 tests with 2 expected skips.
+
+#### 6. Benchmark and profile
+
+Build-time benchmarks cover decode GEMM, prefill GEMM, argmax, and copy-heavy
+operations:
+
+```bash
+./build-mps/tests/benchmark_mps all
+```
+
+Set `CT2_MPS_PROFILE=1` to print command-buffer, synchronization, dispatch,
+copy, GEMM-path, TopK, allocation, and buffer-lookup counters. See
+[environment variables](docs/environment_variables.md) for all tuning and
+diagnostic options.
+
+#### Correctness-validated result
+
+This representative measurement used a Release build, an Apple M1 MacBook Air
+with a 7-core GPU, a real FP16 Marian Roman Pashto translation model, batch
+size 1, and greedy decoding:
+
+| Backend | Inference time | Throughput |
+| --- | ---: | ---: |
+| Optimized CTranslate2 CPU | 306.15 ms | 114.32 tokens/s |
+| MetalTranslate FP16 | 186.96 ms | 187.21 tokens/s |
+
+The result is a **1.64x speedup** and approximately **39% lower latency**.
+Absolute performance varies by model, sequence length, search configuration,
+and Apple chip. Earlier results produced a larger number while generating
+incorrect tokens; those measurements were rejected rather than reported as a
+speedup.
+
+#### Supported precision and operations
 
 The backend supports FP32, FP16, BF16, and the `int8_float32`,
 `int8_float16`, and `int8_bfloat16` hybrid compute types. BF16 values are
 stored in BF16 while GEMM and reduction accumulation use FP32. The INT8 path
 uses signed INT8 matrices, INT32 accumulation, per-row activation scales, and
-a fused dequantization/output kernel. Query the exact runtime capabilities
-with:
+a fused dequantization/output kernel.
 
-```python
-import ctranslate2
-
-print(ctranslate2.get_supported_compute_types("mps"))
-translator = ctranslate2.Translator(model_path,
-                                    device="mps",
-                                    compute_type="float16")
-```
-
-FP16 is the recommended and `auto` compute type for MPS. INT8 reduces stored
-weight size but is not necessarily faster on Apple GPUs, particularly for
-batch-size-1 decoding. The backend also keeps decoding operations such as
-small TopK/argmax, TopP masking, multinomial/Gumbel sampling, ALiBi, median
-filtering, and quantized or dilated Conv1D on the GPU.
+The backend keeps common decoding operations such as small TopK/argmax, TopP
+masking, multinomial/Gumbel sampling, ALiBi, median filtering, and quantized or
+dilated Conv1D on the GPU.
 
 Current MPS limitations include FlashAttention, AWQ INT4, INT16 GEMM,
 distributed collectives, and packed/shifted-u8 INT8 GEMM. GPU TopP currently
 supports up to 1024 classes, and the optimized small TopK path supports
 `k = 1, 2, 4, 8`. Metal kernels are compiled on first use, so performance
-measurements should include warmup runs. MPS cannot be enabled together with
-CUDA or HIP in one build. See [hardware support](docs/hardware_support.md),
+measurements should include warmup runs. See [hardware support](docs/hardware_support.md),
 [quantization](docs/quantization.md), and [installation](docs/installation.md)
-for details.
+for additional details.
+
+### How Codex and GPT-5.6 were used
+
+This backend was not created by asking an AI model for one large patch. Codex,
+powered by GPT-5.6, was used as an agentic systems-engineering partner inside
+the local repository. The work followed an evidence-driven loop: inspect the
+real implementation, form a hypothesis, make a bounded change, compile, test,
+benchmark, and keep or revise the change based on the result.
+
+Codex and GPT-5.6 helped with:
+
+* Tracing CTranslate2's model, operator, `StorageView`, allocator, and primitive
+  call paths across C++, CUDA, and Objective-C++
+* Confirming GEMM dimensions, transpose conventions, strides, and the dominant
+  batch-size-1 decoder shapes before optimizing them
+* Designing the persistent Metal command stream and auditing synchronization
+  boundaries, encoder transitions, and GPU resource lifetimes
+* Implementing and reviewing Metal kernels for GEMV/GEMM, copies, reductions,
+  TopK, sampling, BF16, INT8, and quantized Conv1D
+* Diagnosing nondeterministic, corrupted translations that initially looked
+  fast but were not correct
+* Building profiling instrumentation and interpreting real Marian traces
+* Running Release builds, Metal validation, CPU-versus-MPS tests, and
+  end-to-end translation benchmarks after each major change
+* Rebasing six months of work onto current upstream CTranslate2, resolving
+  conflicts, documenting the backend, and fixing CI failures
+
+The human role remained central: defining the performance target, choosing the
+real Pashto workloads, reviewing changes, running them on physical Apple
+hardware, rejecting invalid benchmark results, and deciding which tradeoffs
+were safe to ship. Codex accelerated the investigation and implementation; it
+did not replace correctness review or measurement.
+
+The source history, tests, benchmark programs, and profiling controls are kept
+in this repository so the result can be inspected and reproduced rather than
+treated as a black-box AI-generated artifact.
 
 ## Web Server
 
