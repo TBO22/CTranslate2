@@ -222,41 +222,43 @@ measurements should include warmup runs. See [hardware support](docs/hardware_su
 [quantization](docs/quantization.md), and [installation](docs/installation.md)
 for additional details.
 
-### How Codex and GPT-5.6 were used
+### How I used Codex and GPT-5.6
 
-This backend was not created by asking an AI model for one large patch. Codex,
-powered by GPT-5.6, was used as an agentic systems-engineering partner inside
-the local repository. The work followed an evidence-driven loop: inspect the
-real implementation, form a hypothesis, make a bounded change, compile, test,
-benchmark, and keep or revise the change based on the result.
+I started this MPS port about six months before the hackathon. I had some of
+the backend and kernels in place, but it was still slower than the CPU and a
+normal translation could suddenly stop with an error such as `MPS Gather not
+implemented`. By the time I returned to it, my fork was also 31 commits behind
+CTranslate2 upstream.
 
-Codex and GPT-5.6 helped with:
+I used Codex with GPT-5.6 directly inside the repository. Most of the time it
+felt like pair programming: I gave it a real crash, incorrect translation, or
+benchmark result, and it searched through the C++, CUDA, Objective-C++, and
+Metal code to find the path involved. We would make one change, compile it,
+run the tests, and then try the actual Roman Pashto model again.
 
-* Tracing CTranslate2's model, operator, `StorageView`, allocator, and primitive
-  call paths across C++, CUDA, and Objective-C++
-* Confirming GEMM dimensions, transpose conventions, strides, and the dominant
-  batch-size-1 decoder shapes before optimizing them
-* Designing the persistent Metal command stream and auditing synchronization
-  boundaries, encoder transitions, and GPU resource lifetimes
-* Implementing and reviewing Metal kernels for GEMV/GEMM, copies, reductions,
-  TopK, sampling, BF16, INT8, and quantized Conv1D
-* Diagnosing nondeterministic, corrupted translations that initially looked
-  fast but were not correct
-* Building profiling instrumentation and interpreting real Marian traces
-* Running Release builds, Metal validation, CPU-versus-MPS tests, and
-  end-to-end translation benchmarks after each major change
-* Rebasing six months of work onto current upstream CTranslate2, resolving
-  conflicts, documenting the backend, and fixing CI failures
+Some of the work Codex helped me finish included the persistent Metal command
+stream, the batch-size-1 GEMV path, Gather and the other missing tensor
+operations, GPU TopK, BF16 and INT8 support, quantized Conv1D, profiling tools,
+and the large upstream merge. It also handled a lot of the repetitive work:
+adding tests, checking odd tensor shapes, rebuilding the Python extension, and
+fixing CI after the code was pushed.
 
-The human role remained central: defining the performance target, choosing the
-real Pashto workloads, reviewing changes, running them on physical Apple
-hardware, rejecting invalid benchmark results, and deciding which tradeoffs
-were safe to ship. Codex accelerated the investigation and implementation; it
-did not replace correctness review or measurement.
+Not every idea was a win. We tested command-buffer limits of 16, 32, 64, and
+128, and 16 was the fastest. We compared the custom GEMV with the general
+matrix path. INT8 worked, but on my M1 it was slower than FP16, so FP16 remains
+the automatic default. Those results came from running the code, not from
+assuming that an optimization must be faster.
 
-The source history, tests, benchmark programs, and profiling controls are kept
-in this repository so the result can be inspected and reproduced rather than
-treated as a black-box AI-generated artifact.
+The biggest lesson came when MPS appeared to be more than twice as fast but
+started producing repeated, random-looking words. I did not count that as a
+speedup. I kept working with Codex until the output was stable and correct,
+then reported the lower but honest 1.64x result.
+
+Codex and GPT-5.6 wrote and reviewed a meaningful part of the implementation,
+but I chose what to build, tested it on my own Mac and models, checked the
+translations, and decided which changes were good enough to keep. This was not
+a one-prompt project. It was six months of unfinished work completed through a
+very practical back-and-forth between me and Codex.
 
 ## Web Server
 
