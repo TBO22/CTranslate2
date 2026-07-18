@@ -87,13 +87,29 @@ The MPS build is currently source-only and requires:
 #### 1. Clone and create a Python environment
 
 ```bash
-git clone https://github.com/TBO22/CTranslate2.git
+git clone --recursive https://github.com/TBO22/CTranslate2.git
 cd CTranslate2
 
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 ```
+
+> [!IMPORTANT]
+> CTranslate2 uses Git submodules for build dependencies such as `cxxopts`,
+> `googletest`, and `spdlog`. GitHub's **Download ZIP** archive does not include
+> their contents. Use the recursive clone command above for a source build.
+
+If the repository was already cloned without `--recursive`, initialize the
+missing dependencies before running CMake:
+
+```bash
+git submodule update --init --recursive
+```
+
+If CMake reports that `third_party/googletest` has no `CMakeLists.txt` or that
+`cxxopts` is missing, the submodules were not initialized; the command above
+fixes both errors.
 
 #### 2. Build and install the C++ library
 
