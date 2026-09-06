@@ -101,12 +101,13 @@ By default, the runtime tries to use the type that is saved in the converted mod
 
 | Device | int8_float32 | int8_float16 | int8_bfloat16 | int16 | float16 | bfloat16 |
 | --- | --- | --- | --- | --- | --- | --- |
-| Apple Silicon GPU | int8_float32 | int8_float16 | int8_bfloat16 | float16 | float16 | bfloat16 |
+| Apple Silicon GPU | int8_float32 | float16 | int8_bfloat16 | float16 | float16 | bfloat16 |
 
-MPS `compute_type="auto"` selects `float16`. The explicit INT8 hybrid modes
-remain available when reduced model weight size or INT8 compatibility is more
-important than latency. On Apple GPUs, INT8 is not guaranteed to outperform
-FP16, especially for batch-size-1 autoregressive decoding.
+MPS `compute_type="auto"`, `int8`, and `int8_float16` select `float16` by
+default. Native INT8 is currently slower than FP16 on Apple GPUs and runtime
+activation quantization can change autoregressive decoding decisions. Set
+`CT2_MPS_CACHE_INT8_FP16=0` to explicitly enable the lower-memory experimental
+INT8 path; in that mode `int8` resolves to `int8_float16`.
 
 ```{tip}
 You can get more information about the detected capabilities of your system by enabling the info logs (set the environment variable `CT2_VERBOSE=1` or call ``ctranslate2.set_log_level(logging.INFO)``).
@@ -143,9 +144,10 @@ Non quantized layers are run in the floating point precision of the original mod
 * `int8_float16`
 * `int8_bfloat16`
 
-On MPS, activations are quantized per row to signed INT8, matrix products
-accumulate in INT32, and the output is dequantized with optional bias and
-activation fusion. Packed and shifted-u8 INT8 matrices are not yet supported.
+In the experimental native MPS mode, activations are quantized per row to
+signed INT8, matrix products accumulate in INT32, and the output is
+dequantized with optional bias and activation fusion. Packed and shifted-u8
+INT8 matrices are not yet supported.
 
 ### 16-bit integers (`int16`)
 

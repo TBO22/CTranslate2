@@ -103,14 +103,14 @@ debugging or performance comparisons.
 
 ## `CT2_MPS_CACHE_INT8_FP16`
 
-Expand INT8 Dense weights to FP16 once on first use so that warm MPS inference
-can use the optimized FP16 matrix kernels without dynamically quantizing every
-activation. This optimization is enabled by default for `int8` and
-`int8_float16` models. Set it to `0` to keep weights compressed in device
-memory and use the lower-memory weight-only INT8 path instead.
+Resolve `int8` and `int8_float16` requests on MPS to the faster and more stable
+FP16 execution path (default). Stored INT8 weights are expanded once while the
+model is loaded; the compressed device allocation is not retained.
 
-The cache does not change the on-disk model size, but its resident memory usage
-is similar to an FP16 model after all Dense layers have run.
+Set this variable to `0` to explicitly keep weights compressed and use the
+experimental native MPS INT8 path. This reduces model memory, but can be slower
+than FP16 and may produce different decoding decisions because activations are
+quantized at runtime.
 
 ## `CT2_FORCE_CPU_ISA`
 
