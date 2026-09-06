@@ -310,7 +310,6 @@ namespace ctranslate2 {
       , _partial_bias(_weight.device(), _bias ? _bias->dtype() : DataType::FLOAT32)
       , _partial_qscale(_weight.device(), DataType::FLOAT32)
       , _partial_u8_shift_compensation(_weight.device(), DataType::INT32)
-      , _mps_float16_weight(_weight.device(), DataType::FLOAT16)
       , _output_type(get_default_float_type(model.effective_compute_type()))
       , _quant_method(model.quant_method())
       , _quantized_gemm(_weight.dtype() == DataType::INT16 || _weight.dtype() == DataType::INT8)
@@ -384,49 +383,6 @@ namespace ctranslate2 {
         const auto device = input.device();
 
 #ifdef CT2_WITH_MPS
-        static const bool cache_int8_as_float16 = []() {
-          const char* value = std::getenv("CT2_MPS_CACHE_INT8_FP16");
-          return !value || value[0] == '\0' || std::string(value) != "0";
-        }();
-        if (cache_int8_as_float16
-            && !affected_by_tp
-            && device == Device::MPS
-            && _mps_float16_weight.empty()
-            && _partial_weight.empty()
-            && _weight.dtype() == DataType::INT8
-            && _output_type == DataType::FLOAT16
-            && qscale
-            && !_packed_weight) {
-          // Dense replicas execute on one worker. Lazily encode the one-time
-          // expansion here so it shares that worker's Metal stream with the
-          // first consuming GEMM; constructing it on the model-loading thread
-          // would leave an unsynchronized cross-stream dependency.
-          ops::Dequantize()(_weight, *qscale, _mps_float16_weight);
-        }
-
-        if (!affected_by_tp
-            && device == Device::MPS
-            && _mps_float16_weight
-            && _partial_weight.empty()
-            && input.dtype() == DataType::FLOAT16
-            && (!bias || bias->dtype() == DataType::FLOAT16)
-            && (!residual || residual->dtype() == DataType::FLOAT16)) {
-          const ops::Gemm float16_gemm(/*alpha=*/1,
-                                       /*beta=*/0,
-                                       /*trans_a=*/false,
-                                       /*trans_b=*/true,
-                                       /*a_is_packed=*/false,
-                                       /*b_is_packed=*/false,
-                                       _activation_type);
-          float16_gemm(input,
-                       _mps_float16_weight,
-                       output,
-                       nullptr,
-                       bias,
-                       residual);
-          return;
-        }
-
         if (!affected_by_tp
             && device == Device::MPS
             && input.dtype() == DataType::FLOAT16

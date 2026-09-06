@@ -150,9 +150,6 @@ namespace ctranslate2 {
       StorageView _partial_bias;
       StorageView _partial_qscale;
       StorageView _partial_u8_shift_compensation;
-      // MPS expands INT8 weights once to FP16 so warm execution can use the
-      // optimized SIMD-group FP16 kernels without per-token conversion.
-      mutable StorageView _mps_float16_weight;
       const DataType _output_type;
       const models::QUANTIZATION_TYPE _quant_method;
       const bool _quantized_gemm;
