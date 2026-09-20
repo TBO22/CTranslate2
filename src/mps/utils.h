@@ -14,6 +14,10 @@ namespace ctranslate2 {
     void set_device_index(int index);
     void flush();
     void synchronize(const char* reason = nullptr, size_t bytes = 0);
+    // Wait for pending work on every thread-local MPS stream. This is the
+    // device-wide counterpart to synchronize(), which only waits for the
+    // calling thread's stream.
+    void synchronize_all();
 
     void* allocate_buffer(size_t size);
     void free_buffer(void* ptr);

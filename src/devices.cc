@@ -141,7 +141,7 @@ namespace ctranslate2 {
 #ifdef CT2_WITH_MPS
     if (device == Device::MPS) {
       const ScopedDeviceSetter scoped_device_setter(device, index);
-      mps::synchronize();
+      mps::synchronize_all();
     }
 #endif
 #if !defined(CT2_WITH_CUDA) && !defined(CT2_WITH_MPS)

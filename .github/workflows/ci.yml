@@ -180,29 +180,75 @@ jobs:
         run: |
           tests/ctranslate2_test tests/data
 
-  # The contributor fork uses its self-hosted Apple Silicon runner. Upstream
-  # keeps the GPU-enabled GitHub runner so this remains mergeable without
-  # depending on infrastructure owned by the contributor.
   build-and-test-mps:
-    if: github.repository != 'TBO22/CTranslate2' || github.event_name == 'push'
-    runs-on: ${{ github.repository == 'TBO22/CTranslate2' && 'self-hosted' || 'macos-15-xlarge' }}
+    runs-on: macos-15
+    timeout-minutes: 30
     env:
       CT2_VERBOSE: 1
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Verify Apple Silicon and execute a Metal kernel
+        run: |
+          test "$(uname -m)" = "arm64"
+          system_profiler SPHardwareDataType SPDisplaysDataType | tee runner-hardware.txt
+          cat > "$RUNNER_TEMP/metal-probe.swift" <<'SWIFT'
+          import Foundation
+          import Metal
+
+          guard let device = MTLCreateSystemDefaultDevice() else {
+              fatalError("No Metal device available on this runner")
+          }
+          print("Metal device: \(device.name)")
+          print("Unified memory: \(device.hasUnifiedMemory)")
+          print("Recommended working set: \(device.recommendedMaxWorkingSetSize) bytes")
+          let source = """
+          #include <metal_stdlib>
+          using namespace metal;
+          kernel void increment(device uint *values [[buffer(0)]],
+                                uint index [[thread_position_in_grid]]) {
+              values[index] += 1;
+          }
+          """
+          let library = try device.makeLibrary(source: source, options: nil)
+          guard let function = library.makeFunction(name: "increment"),
+                let queue = device.makeCommandQueue(),
+                let buffer = device.makeBuffer(length: 4 * MemoryLayout<UInt32>.stride,
+                                               options: .storageModeShared),
+                let commandBuffer = queue.makeCommandBuffer(),
+                let encoder = commandBuffer.makeComputeCommandEncoder() else {
+              fatalError("Could not create Metal compute resources")
+          }
+          let pipeline = try device.makeComputePipelineState(function: function)
+          let values = buffer.contents().bindMemory(to: UInt32.self, capacity: 4)
+          for index in 0..<4 { values[index] = UInt32(index) }
+          encoder.setComputePipelineState(pipeline)
+          encoder.setBuffer(buffer, offset: 0, index: 0)
+          encoder.dispatchThreads(MTLSize(width: 4, height: 1, depth: 1),
+                                  threadsPerThreadgroup: MTLSize(width: 4, height: 1, depth: 1))
+          encoder.endEncoding()
+          commandBuffer.commit()
+          commandBuffer.waitUntilCompleted()
+          guard commandBuffer.status == .completed else {
+              fatalError("Metal command failed: \(String(describing: commandBuffer.error))")
+          }
+          for index in 0..<4 {
+              precondition(values[index] == UInt32(index + 1), "Incorrect Metal kernel result")
+          }
+          print("Metal compute probe passed")
+          SWIFT
+          swift "$RUNNER_TEMP/metal-probe.swift" | tee metal-probe.txt
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Verify Apple Silicon runner
-        run: |
-          test "$(uname -m)" = "arm64"
-          system_profiler SPHardwareDataType SPDisplaysDataType
 
       - name: Configure MPS build
         run: |
@@ -224,6 +270,7 @@ jobs:
           cmake --install build-mps
 
       - name: Download test data
+        id: test_data
         working-directory: tests/data/models
         run: |
           curl --fail --location --output transliteration-aren-all.tar.gz \
@@ -233,14 +280,19 @@ jobs:
       - name: Run MPS runtime test suite
         run: |
           build-mps/tests/ctranslate2_test tests/data \
-            --gtest_filter='MPSBackendTest.*:MPSPrimitiveTest.*:TranslatorTest.MPS*:MPS/*'
+            --gtest_filter='MPSBackendTest.*:MPSPrimitiveTest.*:TranslatorTest.MPS*:MPS/*' \
+            --gtest_output=xml:mps-results.xml
 
       - name: Run CPU and shared test suite from MPS build
+        if: ${{ !cancelled() && steps.test_data.outcome == 'success' }}
         run: |
           build-mps/tests/ctranslate2_test tests/data \
-            --gtest_filter='-MPSBackendTest.*:MPSPrimitiveTest.*:TranslatorTest.MPS*:MPS/*'
+            --gtest_filter='-MPSBackendTest.*:MPSPrimitiveTest.*:TranslatorTest.MPS*:MPS/*' \
+            --gtest_output=xml:cpu-results.xml
 
       - name: Build MPS Python bindings
+        id: build_python
+        if: ${{ !cancelled() && steps.test_data.outcome == 'success' }}
         env:
           CTRANSLATE2_ROOT: ${{ github.workspace }}/install-mps
           CMAKE_BUILD_PARALLEL_LEVEL: 5
@@ -249,10 +301,25 @@ jobs:
           python -m pip install ./python
 
       - name: Test Python CPU selection and explicit MPS inference
+        if: ${{ !cancelled() && steps.build_python.outcome == 'success' }}
         env:
           CT2_TEST_MPS: 1
         run: |
-          python -m pytest --import-mode=importlib -v python/tests/test_mps.py
+          python -m pytest --import-mode=importlib -v python/tests/test_mps.py \
+            --junitxml=python-mps-results.xml
+
+      - name: Upload hardware details and test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mps-macos-15-results
+          retention-days: 7
+          path: |
+            runner-hardware.txt
+            metal-probe.txt
+            mps-results.xml
+            cpu-results.xml
+            python-mps-results.xml
 
   build-python-wheels:
     runs-on: ${{ matrix.os }}

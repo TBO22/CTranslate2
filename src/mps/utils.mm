@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
@@ -279,9 +280,34 @@ namespace ctranslate2 {
       });
     }
 
+    class MPSStream;
+
+    static std::mutex& stream_registry_mutex() {
+      // Thread-local streams can be destroyed during process teardown. Keep
+      // the registry alive until the process exits, just like the in-flight
+      // resource registries above.
+      static std::mutex* mutex = new std::mutex;
+      return *mutex;
+    }
+
+    static std::unordered_set<MPSStream*>& stream_registry() {
+      static auto* streams = new std::unordered_set<MPSStream*>;
+      return *streams;
+    }
+
     class MPSStream {
     public:
+      MPSStream() {
+        std::lock_guard<std::mutex> lock(stream_registry_mutex());
+        stream_registry().insert(this);
+      }
+
       ~MPSStream() {
+        // Holding the registry lock keeps this object alive while a concurrent
+        // device-wide synchronization walks all thread-local streams. If that
+        // synchronization reached this stream first, the second wait below is
+        // a no-op.
+        std::lock_guard<std::mutex> lock(stream_registry_mutex());
         // A worker thread can finish with pending asynchronous work. Wait here
         // so completion handlers cannot outlive process-wide Metal state during
         // thread or process teardown. This is not on the inference hot path.
@@ -291,6 +317,7 @@ namespace ctranslate2 {
         }
         if (_last_submitted)
           [_last_submitted release];
+        stream_registry().erase(this);
       }
 
       id<MTLCommandBuffer> command_buffer() {
@@ -466,6 +493,30 @@ namespace ctranslate2 {
     static MPSStream& current_stream() {
       static thread_local MPSStream stream;
       return stream;
+    }
+
+    void synchronize_all() {
+      if (!has_mps())
+        return;
+
+      std::exception_ptr first_error;
+      {
+        // Device synchronization is an external execution barrier. Keeping
+        // the registry locked prevents a worker stream from being destroyed,
+        // or a new stream from beginning work, while the barrier is draining
+        // all streams that existed when it started.
+        std::lock_guard<std::mutex> lock(stream_registry_mutex());
+        for (MPSStream* stream : stream_registry()) {
+          try {
+            stream->synchronize();
+          } catch (...) {
+            if (!first_error)
+              first_error = std::current_exception();
+          }
+        }
+      }
+      if (first_error)
+        std::rethrow_exception(first_error);
     }
 
     bool has_mps() {
