@@ -4035,6 +4035,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                    float beta,
                    int32_t* c,
                    dim_t ldc) {
+      StreamGuard stream_guard;
       int8_gemm_impl(transpose_a, transpose_b, m, n, k, alpha,
                      a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
     }
@@ -4050,6 +4051,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                              dim_t n,
                                              dim_t k,
                                              int activation) {
+      StreamGuard stream_guard;
       static const bool enabled = []() {
         const char* value = std::getenv("CT2_MPS_USE_WEIGHT_ONLY_INT8");
         return !value || value[0] == '\0' || std::string(value) != "0";
@@ -4171,6 +4173,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                  dim_t ldc,
                                  dim_t stridec,
                                  dim_t batch_size) {
+      StreamGuard stream_guard;
       int8_gemm_impl(transpose_a, transpose_b, m, n, k, alpha,
                      a, lda, stridea, b, ldb, strideb, beta,
                      c, ldc, stridec, batch_size);
@@ -4193,6 +4196,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               dim_t ldc,
               dim_t stridec,
               dim_t batch_size) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || m == 0)
         return;
       if (dtype != DataType::FLOAT32 && dtype != DataType::FLOAT16 && dtype != DataType::BFLOAT16)
@@ -4255,6 +4259,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                   const void* bias,
                   const void* residual,
                   int activation) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || n == 0)
         return;
       if (dtype != DataType::FLOAT32 && dtype != DataType::FLOAT16 && dtype != DataType::BFLOAT16)
@@ -4370,6 +4375,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                             const void* bias,
                             const void* residual,
                             int activation) {
+      StreamGuard stream_guard;
       if (dtype == DataType::FLOAT16
           && !transpose_a
           && transpose_b
@@ -4415,6 +4421,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               float beta,
               void* c,
               dim_t ldc) {
+      StreamGuard stream_guard;
       if (!supports_gemm_type(dtype))
         throw std::invalid_argument("unsupported MPS GEMM dtype");
       if (m == 0 || n == 0)
@@ -4615,6 +4622,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                             dim_t ldc,
                             dim_t stridec,
                             dim_t batch_size) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || m == 0 || n == 0)
         return;
       if (m == 1 && custom_gemv_enabled()) {
@@ -4891,6 +4899,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               dim_t batch_size,
               dim_t depth,
               dim_t k) {
+      StreamGuard stream_guard;
       if (!supports_topk(dtype, k))
         throw std::invalid_argument("unsupported MPS TopK configuration");
       if (batch_size == 0 || depth == 0 || k == 0)
@@ -4995,6 +5004,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                 dim_t beam_size,
                                 dim_t vocabulary_size,
                                 dim_t k) {
+      StreamGuard stream_guard;
       if (dtype != DataType::FLOAT16
           || !logits || !beam_scores || !values || !indices
           || batch_size <= 0 || batch_size > UINT32_MAX
@@ -5048,6 +5058,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void fill(DataType dtype, const void* value, void* y, dim_t size) {
+      StreamGuard stream_guard;
       if (size == 0)
         return;
 
@@ -5088,6 +5099,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                       void* y,
                       const int32_t* indices,
                       dim_t size) {
+      StreamGuard stream_guard;
       if (size == 0)
         return;
       if (size > UINT32_MAX)
@@ -5132,6 +5144,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                   dim_t batch_size,
                                   dim_t length,
                                   dim_t vocabulary_size) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || length <= 0 || vocabulary_size <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(batch_size)
@@ -5167,6 +5180,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                              bool mask_future,
                              bool multi_query,
                              int32_t* mask) {
+      StreamGuard stream_guard;
       if (!fits_u32(batch_size) || !fits_u32(num_heads) || !fits_u32(num_queries))
         throw std::invalid_argument("MPS length mask dimensions are too large");
       const uint64_t total = static_cast<uint64_t>(batch_size)
@@ -5187,18 +5201,21 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void unary(DataType dtype, UnaryOp op, const void* x, void* y, dim_t size) {
+      StreamGuard stream_guard;
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const ElementwiseArgs args{static_cast<uint64_t>(size), op_code(op), 0};
       run_1d(kernel_name("unary", dtype), size, {{x, bytes}, {y, bytes}}, &args, sizeof(args), 2);
     }
 
     void binary(DataType dtype, BinaryOp op, const void* a, const void* b, void* c, dim_t size) {
+      StreamGuard stream_guard;
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const ElementwiseArgs args{static_cast<uint64_t>(size), op_code(op), 0};
       run_1d(kernel_name("binary", dtype), size, {{a, bytes}, {b, bytes}, {c, bytes}}, &args, sizeof(args), 3);
     }
 
     void scalar(DataType dtype, BinaryOp op, float a, const void* x, void* y, dim_t size) {
+      StreamGuard stream_guard;
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const ElementwiseArgs args{static_cast<uint64_t>(size), op_code(op), a};
       run_1d(kernel_name("scalar", dtype), size, {{x, bytes}, {y, bytes}}, &args, sizeof(args), 2);
@@ -5211,6 +5228,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                   dim_t batch_size,
                   dim_t depth,
                   bool round_before_cast) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0)
         return;
       const size_t input_bytes = static_cast<size_t>(batch_size * depth) * dtype_size(dtype);
@@ -5234,6 +5252,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                     void* output,
                     dim_t batch_size,
                     dim_t depth) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(batch_size * depth);
@@ -5261,6 +5280,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                 dim_t batch_size,
                                 dim_t depth,
                                 int activation) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(batch_size * depth);
@@ -5294,6 +5314,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                 dim_t batch_stride,
                 dim_t num_indices,
                 dim_t num_indices_per_batch) {
+      StreamGuard stream_guard;
       if (num_indices == 0 || copy_size == 0)
         return;
       if (num_indices_per_batch <= 0 || num_indices % num_indices_per_batch != 0)
@@ -5379,6 +5400,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                  dim_t b_block_size,
                  void* output,
                  dim_t outer_size) {
+      StreamGuard stream_guard;
       if (outer_size <= 0 || a_block_size <= 0 || b_block_size <= 0)
         return;
       const size_t element_size = dtype_size(dtype);
@@ -5404,6 +5426,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                 void* b,
                 dim_t b_block_size,
                 dim_t outer_size) {
+      StreamGuard stream_guard;
       if (outer_size <= 0 || a_block_size <= 0 || b_block_size <= 0)
         return;
       const size_t element_size = dtype_size(dtype);
@@ -5431,6 +5454,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                 void* c,
                 dim_t c_block_size,
                 dim_t outer_size) {
+      StreamGuard stream_guard;
       if (outer_size <= 0 || a_block_size <= 0 || b_block_size <= 0 || c_block_size <= 0)
         return;
       const size_t element_size = dtype_size(dtype);
@@ -5458,6 +5482,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               dim_t outer_size,
               dim_t inner_size,
               dim_t num_tiles) {
+      StreamGuard stream_guard;
       const uint64_t output_size =
         static_cast<uint64_t>(outer_size * inner_size * num_tiles);
       if (output_size == 0)
@@ -5492,6 +5517,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                   dim_t value_size,
                   dim_t block,
                   int activation) {
+      StreamGuard stream_guard;
       if (value_size == 0)
         return;
       const size_t element_size = dtype_size(dtype);
@@ -5521,6 +5547,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                          void* c,
                          dim_t a_size,
                          dim_t b_size) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const BroadcastArgs args{static_cast<uint64_t>(a_size),
                                static_cast<uint64_t>(b_size),
@@ -5544,6 +5571,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                          void* c,
                          dim_t a_size,
                          dim_t b_size) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const BroadcastArgs args{static_cast<uint64_t>(a_size),
                                static_cast<uint64_t>(b_size),
@@ -5568,6 +5596,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                          dim_t block,
                          dim_t a_size,
                          dim_t b_size) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const BroadcastArgs args{static_cast<uint64_t>(a_size),
                                static_cast<uint64_t>(b_size),
@@ -5585,6 +5614,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void transpose_2d(DataType dtype, const void* a, dim_t rows, dim_t cols, void* b) {
+      StreamGuard stream_guard;
       const uint64_t size = static_cast<uint64_t>(rows * cols);
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const Transpose2DArgs args{static_cast<uint64_t>(rows), static_cast<uint64_t>(cols)};
@@ -5592,6 +5622,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void transpose_3d(DataType dtype, const void* a, const dim_t* dims, const dim_t* perm, void* b) {
+      StreamGuard stream_guard;
       const uint64_t size = static_cast<uint64_t>(dims[0] * dims[1] * dims[2]);
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const TransposeNDArgs args{static_cast<uint64_t>(dims[0]),
@@ -5606,6 +5637,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void transpose_4d(DataType dtype, const void* a, const dim_t* dims, const dim_t* perm, void* b) {
+      StreamGuard stream_guard;
       const uint64_t size = static_cast<uint64_t>(dims[0] * dims[1] * dims[2] * dims[3]);
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       if (profile_enabled()) {
@@ -5669,6 +5701,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                  dim_t batch_size,
                  dim_t depth,
                  bool log) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const size_t bytes = static_cast<size_t>(batch_size * depth) * element_size;
       const SoftmaxArgs args{static_cast<uint64_t>(batch_size),
@@ -5698,6 +5731,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                          dim_t depth,
                          float scale,
                          dim_t interleaved_num_heads) {
+      StreamGuard stream_guard;
       if (dtype != DataType::FLOAT16
           || batch_size <= 0
           || query_length <= 0
@@ -5780,6 +5814,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               dim_t axis_size,
               dim_t inner_size,
               bool get_sum) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const uint64_t output_size = static_cast<uint64_t>(outer_size * inner_size);
       const MeanArgs args{static_cast<uint64_t>(outer_size),
@@ -5815,6 +5850,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                     dim_t axis_size,
                     dim_t inner_size,
                     float epsilon) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const size_t tensor_bytes = static_cast<size_t>(outer_size * axis_size * inner_size) * element_size;
       const size_t param_bytes = static_cast<size_t>(axis_size) * element_size;
@@ -5849,6 +5885,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                         dim_t rows,
                                         dim_t depth,
                                         float epsilon) {
+      StreamGuard stream_guard;
       if (dtype != DataType::FLOAT16
           || !input || !bias || !residual || !gamma || !beta || !output
           || rows <= 0 || depth <= 0)
@@ -5888,6 +5925,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                   dim_t depth,
                   float epsilon,
                   bool use_residual) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const size_t tensor_bytes = static_cast<size_t>(batch_size * depth) * element_size;
       const size_t gamma_bytes = static_cast<size_t>(depth) * element_size;
@@ -5917,6 +5955,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                 dim_t ndims,
                 dim_t depth,
                 bool interleave) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const uint64_t size = static_cast<uint64_t>(batch_size * max_time * depth);
       const RotaryArgs args{size,
@@ -5949,6 +5988,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                        dim_t k,
                        dim_t in_batch_stride,
                        dim_t in_group_stride) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const uint64_t total = static_cast<uint64_t>(batch_size * groups * output_length * k);
       const Im2Col1DArgs args{total,
@@ -5978,6 +6018,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                        dim_t rows,
                        dim_t depth,
                        dim_t width) {
+      StreamGuard stream_guard;
       if (rows <= 0 || depth <= 0)
         return;
       if (width <= 0 || (width & 1) == 0 || width > 129)
@@ -6019,6 +6060,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                     dim_t depth,
                     float probability,
                     float mask_value) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0)
         return;
       if (depth > max_top_p_classes())
@@ -6060,6 +6102,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                      dim_t batch_size,
                      dim_t depth,
                      dim_t sample_size) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0 || sample_size <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(batch_size * sample_size);
@@ -6083,6 +6126,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                       const void* input,
                       void* output,
                       dim_t size) {
+      StreamGuard stream_guard;
       if (size <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(size);
@@ -6111,6 +6155,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                    dim_t key_length,
                    dim_t cached_key_length,
                    dim_t alibi_offset) {
+      StreamGuard stream_guard;
       const uint64_t total = static_cast<uint64_t>(batch_size)
                              * static_cast<uint64_t>(num_heads)
                              * static_cast<uint64_t>(query_length)

@@ -6,8 +6,10 @@
 #include "ctranslate2/ops/ops.h"
 #include "ctranslate2/primitives.h"
 #ifdef CT2_WITH_MPS
+#  include <atomic>
 #  include <chrono>
 #  include <future>
+#  include <thread>
 #  include "ctranslate2/allocator.h"
 #  include "ctranslate2/devices.h"
 #  include "mps/kernels.h"
@@ -1577,6 +1579,63 @@ TEST(MPSBackendTest, DeviceSynchronizeWaitsForAnotherThreadsWork) {
 
   EXPECT_EQ(value_after_device_sync, 42.f);
   EXPECT_EQ(output.data<float>()[0], 42.f);
+}
+
+TEST(MPSBackendTest, DeviceSynchronizeIsSafeDuringConcurrentEncoding) {
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> operations{0};
+  std::atomic<size_t> synchronizations{0};
+  std::promise<void> worker_ready;
+  auto worker_ready_future = worker_ready.get_future();
+
+  auto worker = std::async(std::launch::async, [&]() {
+    bool signaled_ready = false;
+    try {
+      StorageView a({256, 256}, 1.f, Device::MPS);
+      StorageView b({256, 256}, 2.f, Device::MPS);
+      StorageView c(Device::MPS);
+      const ops::MatMul matmul;
+      worker_ready.set_value();
+      signaled_ready = true;
+      while (!stop.load(std::memory_order_relaxed)) {
+        matmul(a, b, c);
+        operations.fetch_add(1, std::memory_order_relaxed);
+      }
+      synchronize_stream(Device::MPS);
+    } catch (...) {
+      stop.store(true, std::memory_order_relaxed);
+      if (!signaled_ready)
+        worker_ready.set_value();
+      throw;
+    }
+  });
+
+  if (worker_ready_future.wait_for(std::chrono::seconds(10))
+      != std::future_status::ready) {
+    stop.store(true, std::memory_order_relaxed);
+    EXPECT_NO_THROW(worker.get());
+    FAIL() << "MPS worker did not start encoding";
+    return;
+  }
+
+  auto synchronizer = std::async(std::launch::async, [&]() {
+    try {
+      while (!stop.load(std::memory_order_relaxed)) {
+        synchronize_device(Device::MPS, 0);
+        synchronizations.fetch_add(1, std::memory_order_relaxed);
+      }
+    } catch (...) {
+      stop.store(true, std::memory_order_relaxed);
+      throw;
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  stop.store(true, std::memory_order_relaxed);
+  EXPECT_NO_THROW(worker.get());
+  EXPECT_NO_THROW(synchronizer.get());
+  EXPECT_GT(operations.load(std::memory_order_relaxed), 0u);
+  EXPECT_GT(synchronizations.load(std::memory_order_relaxed), 0u);
 }
 
 TEST(MPSBackendTest, ActiveTemporaryFreesAreProcessedAfterCompletion) {

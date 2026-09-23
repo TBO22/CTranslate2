@@ -320,6 +320,14 @@ namespace ctranslate2 {
         stream_registry().erase(this);
       }
 
+      void lock() {
+        _mutex.lock();
+      }
+
+      void unlock() {
+        _mutex.unlock();
+      }
+
       id<MTLCommandBuffer> command_buffer() {
         throw_last_command_error();
         if (!_command_buffer) {
@@ -414,10 +422,12 @@ namespace ctranslate2 {
       }
 
       bool has_active_buffer(void* buffer) const {
+        std::lock_guard<std::recursive_mutex> lock(_mutex);
         return _active_buffers.find(buffer) != _active_buffers.end();
       }
 
       void flush() {
+        std::lock_guard<std::recursive_mutex> lock(_mutex);
         end_active_encoder();
         if (!_command_buffer)
           return;
@@ -447,6 +457,7 @@ namespace ctranslate2 {
       }
 
       void synchronize() {
+        std::lock_guard<std::recursive_mutex> lock(_mutex);
         end_active_encoder();
         id<MTLCommandBuffer> submitted = _command_buffer;
         std::shared_ptr<std::vector<void*>> resources;
@@ -481,6 +492,9 @@ namespace ctranslate2 {
       }
 
     private:
+      // Encoding entry points reuse one another (for example batched GEMM can
+      // call GEMM), so nested StreamGuards on the owning thread are expected.
+      mutable std::recursive_mutex _mutex;
       id<MTLCommandBuffer> _command_buffer = nil;
       id<MTLCommandBuffer> _last_submitted = nil;
       id<MTLComputeCommandEncoder> _compute_encoder = nil;
@@ -493,6 +507,15 @@ namespace ctranslate2 {
     static MPSStream& current_stream() {
       static thread_local MPSStream stream;
       return stream;
+    }
+
+    StreamGuard::StreamGuard()
+      : _stream(&current_stream()) {
+      static_cast<MPSStream*>(_stream)->lock();
+    }
+
+    StreamGuard::~StreamGuard() {
+      static_cast<MPSStream*>(_stream)->unlock();
     }
 
     void synchronize_all() {

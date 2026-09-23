@@ -19,6 +19,21 @@ namespace ctranslate2 {
     // calling thread's stream.
     void synchronize_all();
 
+    // Serializes a complete kernel encoding sequence with device-wide
+    // synchronization. MPS streams are thread-local, so this lock is
+    // uncontended during normal inference.
+    class StreamGuard {
+    public:
+      StreamGuard();
+      ~StreamGuard();
+
+      StreamGuard(const StreamGuard&) = delete;
+      StreamGuard& operator=(const StreamGuard&) = delete;
+
+    private:
+      void* _stream;
+    };
+
     void* allocate_buffer(size_t size);
     void free_buffer(void* ptr);
 
