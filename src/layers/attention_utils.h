@@ -25,7 +25,8 @@ namespace ctranslate2 {
                                dim_t beam_size = 1,
                                Alibi* alibi = nullptr,
                                StorageView* position_bias = nullptr,
-                               bool interleaved_queries = false);
+                               bool interleaved_queries = false,
+                               dim_t window = 0, dim_t offset = 0);
 
   }
 }

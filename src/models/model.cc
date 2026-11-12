@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <limits>
+#include <cmath>
 
 #include "ctranslate2/models/model_factory.h"
 #include "ctranslate2/ops/ops.h"
@@ -164,8 +165,11 @@ namespace ctranslate2 {
 
     Model::~Model() {
       if (!_variable_index.empty()) {
+        if (_device == Device::MPS)
+          synchronize_device(_device, _device_index);  // Retain weights until queued work finishes.
         _variable_index.clear();
-        synchronize_device(_device, _device_index);  // Wait for asynchronous deallocations.
+        if (_device != Device::MPS)
+          synchronize_device(_device, _device_index);  // Wait for asynchronous deallocations.
       }
     }
 
@@ -190,6 +194,38 @@ namespace ctranslate2 {
       if (_device != Device::CPU)
         throw std::runtime_error("set_compute_type expects the variables to be on CPU");
 
+      // Native INT4 uses its own packed variable names, so legacy INT8 dtype
+      // conversion never mistakes nibbles for signed byte weights.
+      const auto int4_variables = _variable_index;
+      for (const auto& pair : int4_variables) {
+        if (!ends_with(pair.first, "/weight_int4")) continue;
+        const auto scope = pair.first.substr(0, pair.first.size()-12);
+        const auto& packed = *pair.second;
+        const auto& scales = get_variable(scope + "/weight_int4_scale");
+        const dim_t depth = get_attribute<int32_t>(scope + "/int4_depth");
+        if (packed.dtype() != DataType::INT8 || packed.rank() != 2 || depth <= 0 ||
+            packed.dim(0) <= 0 || packed.dim(1) != (depth+1)/2 ||
+            scales.dtype() != DataType::FLOAT32 || scales.shape() != Shape{packed.dim(0),(depth+63)/64} ||
+            get_variable_if_exists(scope + "/weight") || _tensor_parallel)
+          throw std::invalid_argument("Invalid or unsupported native INT4 matrix: " + scope);
+        for (dim_t i=0;i<scales.size();++i)
+          if (!std::isfinite(scales.data<float>()[i]) || scales.data<float>()[i] <= 0)
+            throw std::invalid_argument("INT4 scales must be finite and positive");
+        if (device == Device::CPU) {
+          StorageView unpacked({packed.dim(0),depth},DataType::FLOAT32);
+          const auto* bytes = reinterpret_cast<const uint8_t*>(packed.buffer());
+          for(dim_t n=0;n<packed.dim(0);++n) for(dim_t k=0;k<depth;++k) {
+            const int q = int((bytes[n*packed.dim(1)+k/2] >> ((k%2)*4))&15)-8;
+            unpacked.data<float>()[n*depth+k] = float(float16_t(q*scales.data<float>()[n*scales.dim(1)+k/64]));
+          }
+          register_variable(scope + "/weight",std::move(unpacked));
+          remove_variable(pair.first);
+          remove_variable(scope + "/weight_int4_scale");
+          remove_variable(scope + "/int4_depth");
+        } else if (device != Device::MPS ||
+                   (type != ComputeType::DEFAULT && type != ComputeType::AUTO && type != ComputeType::FLOAT16))
+          throw std::invalid_argument("Native INT4 supports MPS float16 or a CPU reference");
+      }
       prepare_weights(type, device, device_index, update_weight);
       _saved_compute_type = infer_compute_type();
       _requested_compute_type = type;

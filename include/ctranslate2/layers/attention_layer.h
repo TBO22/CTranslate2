@@ -45,6 +45,10 @@ namespace ctranslate2 {
         return _multi_query;
       }
 
+      bool interleaved_length_mask() const {
+        return _interleaved_lengths;
+      }
+
       static StorageView prepare_length_mask(const StorageView& lengths,
                                              const dim_t num_heads,
                                              const dim_t num_queries,
@@ -67,6 +71,8 @@ namespace ctranslate2 {
       const bool _multi_query;
       const dim_t _num_heads_kv;
       const dim_t _sliding_window;
+      const bool _absolute_window;
+      const bool _interleaved_lengths;
     };
 
     enum class RotaryScalingType {

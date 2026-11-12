@@ -39,6 +39,8 @@ class MultiHeadAttentionSpec(model_spec.LayerSpec):
         merged_encoder_attention=False,
     ):
         self.queries_scale = model_spec.OPTIONAL
+        self.absolute_window = model_spec.OPTIONAL
+        self.sliding_window = model_spec.OPTIONAL
 
         if has_norm:
             self.layer_norm = common_spec.LayerNormSpec(rms_norm=rms_norm)

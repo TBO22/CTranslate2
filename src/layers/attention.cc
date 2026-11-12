@@ -11,12 +11,17 @@
 #include <numeric>
 #include <cstdint>
 #include <stdexcept>
+#include <limits>
 
 #include "dispatch.h"
 #include "cpu/parallel.h"
 
 #ifdef CT2_WITH_CUDA
 #  include "cuda/utils.h"
+#endif
+
+#ifdef CT2_WITH_MPS
+#  include "mps/kernels.h"
 #endif
 
 namespace ctranslate2 {
@@ -215,10 +220,11 @@ namespace ctranslate2 {
                                dim_t beam_size,
                                Alibi* alibi,
                                StorageView* position_bias,
-                               bool interleaved_queries) {
+                               bool interleaved_queries, dim_t window, dim_t offset) {
       PROFILE("dot_product_attention");
 
-      if (!relative_position_keys
+      if (!window
+          && !relative_position_keys
           && !relative_asymmetric_position_keys
           && !relative_position_values
           && !relative_attention_bias
@@ -260,7 +266,7 @@ namespace ctranslate2 {
                               beam_size,
                               alibi,
                               position_bias,
-                              false);
+                              false, window, offset);
         transpose_op(standard_output, output);
         return;
       }
@@ -349,6 +355,35 @@ namespace ctranslate2 {
       if (alibi)
         alibi->apply(scores, queries_scale);
 
+      // Absolute window masks also cover prefills longer than the window.
+      StorageView window_bounds(DataType::INT32, scores.device());
+      if (window) {
+        const dim_t qlen = queries.dim(2), klen = keys.dim(2);
+        const dim_t rows = scores.size() / klen;
+        window_bounds.resize({rows});
+#ifdef CT2_WITH_MPS
+        if (scores.device() == Device::MPS) {
+          mps::mask_flash_scores(scores.dtype(), scores.buffer(),
+              values_lengths ? values_lengths->data<int32_t>() : nullptr,
+              window_bounds.data<int32_t>(), rows, queries.dim(1), qlen,
+              klen, offset, window, true, false);
+        } else
+#endif
+        if (scores.device() == Device::CPU && scores.dtype() == DataType::FLOAT32) {
+          for (dim_t row = 0; row < rows; ++row) {
+            const dim_t position = offset + row % qlen;
+            const dim_t first = std::max<dim_t>(0, position + 1 - window);
+            dim_t end = std::min<dim_t>(klen, position + 1);
+            if (values_lengths) end = std::min<dim_t>(end, values_lengths->data<int32_t>()[row]);
+            window_bounds.data<int32_t>()[row] = end > first ? end : 0;
+            std::fill_n(scores.data<float>() + row*klen, std::min(first,klen),
+                        -std::numeric_limits<float>::infinity());
+          }
+        } else
+          throw std::invalid_argument("Absolute window attention supports CPU float32 and MPS fp16/bf16");
+        values_lengths = &window_bounds;
+      }
+
       StorageView attn(scores.dtype(), scores.device());
       if (attention && !return_normalized_attention) {
         ops::SoftMax()(scores, values_lengths, attn);
@@ -397,6 +432,7 @@ namespace ctranslate2 {
       , _relative_asymmetric_position_keys(model.get_variable_if_exists(scope + "/relative_asymmetric_position_keys"))
       , _relative_position_values(model.get_variable_if_exists(scope + "/relative_position_values"))
       , _merge_time_and_head_dims(_multi_query
+                                  && !_absolute_window
                                   && !_relative_attention_bias
                                   && !_relative_position_keys
                                   && !_relative_position_values)
@@ -662,7 +698,7 @@ namespace ctranslate2 {
             tmp = std::move(*cached_values);
             concat_op({&tmp, &values_proj}, *cached_values);
 
-            if (!prefilling && _sliding_window > 0 && cached_keys->shape()[2] > _sliding_window) {
+            if (!_absolute_window && !prefilling && _sliding_window > 0 && cached_keys->shape()[2] > _sliding_window) {
               // only for generation
               const ops::Slide slide_op(2, 1, cached_keys->shape()[2] - 1);
               slide_op(*cached_keys, tmp);
@@ -700,9 +736,11 @@ namespace ctranslate2 {
                             beam_size,
                             _alibi,
                             position_bias,
-                            interleaved_beam_layout);
+                            interleaved_beam_layout,
+                            _absolute_window && _self_attention ? _sliding_window : 0,
+                            offset);
 
-      if (prefilling && cached_keys && cached_keys->shape()[2] > _sliding_window) {
+      if (!_absolute_window && prefilling && cached_keys && cached_keys->shape()[2] > _sliding_window) {
         // set only last sliding_window tokens to cached_keys and cached_values after computing attention
         const ops::Slide slide_op(2, cached_keys->shape()[2] - _sliding_window, _sliding_window);
         StorageView tmp(dtype, device);

@@ -293,7 +293,7 @@ namespace ctranslate2 {
       decoder.update_output_layer(_model->preferred_size_multiple());
       auto state = decoder.initial_state(/*iterative_decoding=*/false);
 
-      StorageView logits(decoder.output_type(), decoder.device());
+      StorageView logits(decoder.logits_type(), decoder.device());
       decoder(ids, lengths, state, logits);
       return logits;
     }

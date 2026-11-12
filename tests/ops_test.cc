@@ -1,3 +1,4 @@
+#include "ctranslate2/ops/moe_topk.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -2742,8 +2743,6 @@ TEST_P(OpDeviceTest, SnakeValidationLeavesOutputUntouched) {
 
 TEST_P(OpDeviceTest, MoeTopKParallelRoutingMatchesCpuAcrossWidthsAndTies) {
   const Device device = GetParam();
-  if (device == Device::MPS)
-    GTEST_SKIP() << "MoeTopK is not implemented for MPS.";
   for (dim_t width : {1, 17, 256, 513}) {
     for (dim_t k : {dim_t(1), std::min(dim_t(8), width), width}) {
       SCOPED_TRACE("width=" + std::to_string(width) + ", k=" + std::to_string(k));
@@ -2816,8 +2815,6 @@ TEST(OpTest, MoeTopKNonfiniteLogits) {
 
 TEST_P(OpDeviceTest, MoeTopKNonfiniteLogits) {
   const Device device = GetParam();
-  if (device == Device::MPS)
-    GTEST_SKIP() << "MoeTopK is not implemented for MPS.";
   check_moe_topk_nonfinite(device);
 }
 
@@ -2913,13 +2910,11 @@ TEST(OpTest, MoeTopKRetainedCapacityAliasing) {
 
 TEST_P(OpDeviceTest, MoeTopKValidationAndEmptyRows) {
   const Device device = GetParam();
-  if (device == Device::MPS)
-    GTEST_SKIP() << "MoeTopK is not implemented for MPS.";
   StorageView host({1, 3}, 1.f);
   auto logits = host.to(device);
   StorageView ids(DataType::INT32, device), weights(DataType::FLOAT32, device);
   EXPECT_THROW(ops::MoeTopK(4)(logits, ids, weights), std::invalid_argument);
-  if (device == Device::CUDA)
+  if (device != Device::CPU)
     EXPECT_THROW(ops::MoeTopK(2)(host, ids, weights), std::invalid_argument);
   EXPECT_THROW(ops::MoeTopK(2)(logits, ids, logits), std::invalid_argument);
   StorageView empty({0, 3}, DataType::FLOAT32, device);

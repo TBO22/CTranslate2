@@ -13,6 +13,21 @@ namespace ctranslate2 {
       , _cache_time_dim(1)
     {
       ERROR_CHECK((self_attention), "FlashAttention only supports the self-attention");
+#ifdef CT2_WITH_MPS
+      if (model.device() == Device::MPS) {
+        _mps_q_norm = build_optional_layer<LayerNorm>(model, scope + "/q_norm");
+        _mps_k_norm = build_optional_layer<LayerNorm>(model, scope + "/k_norm");
+        _mps_v_norm = build_optional_layer<LayerNorm>(model, scope + "/v_norm");
+        if (_alibi || model.get_variable_if_exists(scope + "/relative_attention_bias")
+            || model.get_variable_if_exists(scope + "/relative_position_keys")
+            || model.get_variable_if_exists(scope + "/relative_asymmetric_position_keys")
+            || model.get_variable_if_exists(scope + "/relative_position_values")
+            || model.get_variable_if_exists(scope + "/memory_kv/weight")
+            || model.get_variable_if_exists(scope + "/memory_kv/weight_packed")) {
+          throw std::invalid_argument("MPS FlashAttention does not support relative bias or merged encoder attention; use flash_attention=False");
+        }
+      }
+#endif
     }
 
     void FlashMultiHeadAttention::operator()(const StorageView& queries,
@@ -30,6 +45,14 @@ namespace ctranslate2 {
       PROFILE("MultiHeadAttention");
       const Device device = queries.device();
       const DataType dtype = queries.dtype();
+
+#ifdef CT2_WITH_MPS
+      if (device == Device::MPS) {
+        compute_mps(queries, values_lengths, output, cached_keys, cached_values,
+                      attention, queries_padder, return_normalized_attention, offset);
+        return;
+      }
+#endif
 
       StorageView fused_proj(dtype, device);
       StorageView queries_proj(dtype, device);
