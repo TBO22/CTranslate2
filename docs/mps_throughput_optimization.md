@@ -19,7 +19,14 @@ branches and scalar loads sat inside the reduction loop.
   there is no full-matrix dequantization or per-token packing.
 * The vector path requires the existing aligned, depth-divisible-by-eight
   layout. FP32, BF16, odd depths, and unsupported alignment retain the scalar
-  path. Prefill GEMM is unchanged.
+  path.
+* Short FP16/INT4 expert prefills (9 through 63 input rows) now use a
+  16x64x32 SIMD-matrix tile with half threadgroup storage and FP32 accumulation.
+  This shares the long-prefill kernel's implementation, reduces barriers and
+  reuses activations across more output columns than the 16x32x16 fallback.
+  Complete 31-row expert evaluation measured 2.18 versus 7.61 ms in the A/B
+  diagnostic. Long prefills retain their 64x64x32 tile. Other storage types and
+  explicit reference comparisons retain the generic implementation.
 * Small GEMV routing plans with at most 128 assignments now generate expert
   offsets, stable permutations, inverse permutations, and indirect grids in
   one dispatch instead of three. Each expert computes its prefix independently
@@ -67,6 +74,7 @@ Diagnostic A/B switches, recorded in benchmark metadata:
 CT2_MPS_DISABLE_VECTOR_MOE=1
 CT2_MPS_DISABLE_SMALL_MOE_PLAN=1
 CT2_MPS_DISABLE_COOPERATIVE_QK=1
+CT2_MPS_DISABLE_SHORT_MOE_GEMM=1
 ```
 
 The internal `force_generic_plan` argument supports exact plan/expert regression

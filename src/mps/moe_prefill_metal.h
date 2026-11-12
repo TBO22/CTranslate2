@@ -1,23 +1,23 @@
 // Uses the existing Dense SIMD fragment layout, adapted from Apple MLX Steel
 // (Copyright (c) 2024 Apple Inc., Apache-2.0), with GPU expert permutation.
 R"METAL(
-template<bool GATED>
+template<bool GATED, uint BM>
 inline void moe_wide_f16(
     device const half* input, device const half* gate, device const half* up,
     device half* output, device const uint* offsets, device const uint* permutation,
     device const float* gate_scale, device const float* up_scale,
     constant MoeGemmArgs& a, uint2 group, uint lane, uint simd,
     threadgroup half* as, threadgroup half* gs, threadgroup half* us) {
-  constexpr uint BM = 64, BN = 64, BK = 32, LD = 40;
+  constexpr uint BN = 64, BK = 32, LD = 40, RN = BM/16;
   const uint first = offsets[a.expert], count = offsets[a.expert+1]-first;
   const uint tile_row = group.y*BM, tile_col = group.x*BN;
   if (tile_row >= count) return;
   struct alignas(16) Half8Bytes { uchar bytes[16]; };
-  const uint tid = simd*32+lane, simd_row = (simd>>1)*32, simd_col = (simd&1)*32;
+  const uint tid = simd*32+lane, simd_row = (simd>>1)*(BM/2), simd_col = (simd&1)*32;
   const uint quad = lane>>2, fr = (quad&4)+((lane>>1)&3), fc = (quad&2)*2+(lane&1)*2;
-  simdgroup_matrix<float,8,8> cg[4][4], cu[4][4];
+  simdgroup_matrix<float,8,8> cg[RN][4], cu[RN][4];
   #pragma clang loop unroll(full)
-  for (uint i = 0; i < 4; ++i) {
+  for (uint i = 0; i < RN; ++i) {
     #pragma clang loop unroll(full)
     for (uint j = 0; j < 4; ++j) {
       cg[i][j].thread_elements()[0] = cg[i][j].thread_elements()[1] = 0;
@@ -61,9 +61,9 @@ inline void moe_wide_f16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     #pragma clang loop unroll(full)
     for (uint ki = 0; ki < 4; ++ki) {
-      simdgroup_matrix<float,8,8> af[4], gf[4], uf[4];
+      simdgroup_matrix<float,8,8> af[RN], gf[4], uf[4];
       #pragma clang loop unroll(full)
-      for (uint i = 0; i < 4; ++i) {
+      for (uint i = 0; i < RN; ++i) {
         const uint r = simd_row+i*8+fr, c = ki*8+fc;
         af[i].thread_elements()[0] = float(as[r*LD+c]);
         af[i].thread_elements()[1] = float(as[r*LD+c+1]);
@@ -79,7 +79,7 @@ inline void moe_wide_f16(
         }
       }
       #pragma clang loop unroll(full)
-      for (uint i = 0; i < 4; ++i) {
+      for (uint i = 0; i < RN; ++i) {
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 4; ++j) {
           simdgroup_multiply_accumulate(cg[i][j], af[i], gf[j], cg[i][j]);
@@ -90,7 +90,7 @@ inline void moe_wide_f16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   #pragma clang loop unroll(full)
-  for (uint i = 0; i < 4; ++i) {
+  for (uint i = 0; i < RN; ++i) {
     const uint row = tile_row+simd_row+i*8+fr;
     if (row >= count) continue;
     #pragma clang loop unroll(full)
@@ -115,7 +115,7 @@ kernel void moe_expert_gate_up_f16_64x64(
     device const float* gate_scale [[buffer(7)]], device const float* up_scale [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
   threadgroup half as[64*40], gs[64*40], us[64*40];
-  moe_wide_f16<true>(input, gate, up, output, offsets, permutation, gate_scale, up_scale, a, group, lane, simd, as, gs, us);
+  moe_wide_f16<true,64>(input, gate, up, output, offsets, permutation, gate_scale, up_scale, a, group, lane, simd, as, gs, us);
 }
 kernel void moe_expert_down_f16_64x64(
     device const half* input [[buffer(0)]], device const half* gate [[buffer(1)]],
@@ -125,6 +125,26 @@ kernel void moe_expert_down_f16_64x64(
     device const float* gate_scale [[buffer(7)]], device const float* up_scale [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
   threadgroup half as[64*40], gs[64*40];
-  moe_wide_f16<false>(input, gate, up, output, offsets, permutation, gate_scale, up_scale, a, group, lane, simd, as, gs, gs);
+  moe_wide_f16<false,64>(input, gate, up, output, offsets, permutation, gate_scale, up_scale, a, group, lane, simd, as, gs, gs);
+}
+kernel void moe_expert_gate_up_f16_16x64(
+    device const half* input [[buffer(0)]], device const half* gate [[buffer(1)]],
+    device const half* up [[buffer(2)]], device half* output [[buffer(3)]],
+    device const uint* offsets [[buffer(4)]], device const uint* permutation [[buffer(5)]],
+    constant MoeGemmArgs& a [[buffer(6)]],
+    device const float* gate_scale [[buffer(7)]], device const float* up_scale [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half as[16*40], gs[64*40], us[64*40];
+  moe_wide_f16<true,16>(input, gate, up, output, offsets, permutation, gate_scale, up_scale, a, group, lane, simd, as, gs, us);
+}
+kernel void moe_expert_down_f16_16x64(
+    device const half* input [[buffer(0)]], device const half* gate [[buffer(1)]],
+    device const half* up [[buffer(2)]], device half* output [[buffer(3)]],
+    device const uint* offsets [[buffer(4)]], device const uint* permutation [[buffer(5)]],
+    constant MoeGemmArgs& a [[buffer(6)]],
+    device const float* gate_scale [[buffer(7)]], device const float* up_scale [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half as[16*40], gs[64*40];
+  moe_wide_f16<false,16>(input, gate, up, output, offsets, permutation, gate_scale, up_scale, a, group, lane, simd, as, gs, gs);
 }
 )METAL"

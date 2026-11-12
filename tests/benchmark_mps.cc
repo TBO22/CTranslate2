@@ -149,7 +149,7 @@ void benchmark_moe_experts() {
   std::vector<std::array<const StorageView*, 3>> weights;
   for (const auto& expert : storage)
     weights.push_back({&expert[0], &expert[1], &expert[2]});
-  for (dim_t rows : {1, 8, 128, 512, 2048}) {
+  for (dim_t rows : {1, 8, 31, 128, 512, 2048}) {
     StorageView x({rows, hidden}, float16_t(.01f), Device::MPS);
     std::vector<int32_t> selected(rows * topk);
     for (dim_t r = 0; r < rows; ++r) {

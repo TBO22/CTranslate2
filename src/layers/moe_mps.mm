@@ -1,6 +1,7 @@
 #include "mps/kernels.h"
 #include "mps/moe.h"
 #include <climits>
+#include <cstdlib>
 
 namespace ctranslate2 {
   namespace mps {
@@ -25,8 +26,13 @@ namespace ctranslate2 {
         throw std::invalid_argument("Unsupported MPS MoE workspace dimensions");
       const auto dtype = input.dtype();
       const bool decode = force_gemv || moe_use_gemv(rows);
+      static const bool disable_short_gemm = [] {
+        const char* value = std::getenv("CT2_MPS_DISABLE_SHORT_MOE_GEMM");
+        return value && value[0] && std::string(value) != "0";
+      }();
       const bool wide = !decode && !force_small_tiles &&
-                        dtype == DataType::FLOAT16 && rows >= 64;
+                        dtype == DataType::FLOAT16 &&
+                        (rows >= 64 || !disable_short_gemm);
       StorageView offsets({count + 1}, DataType::INT32, Device::MPS),
           permutation({rows, topk}, DataType::INT32, Device::MPS),
           inverse(permutation.shape(), DataType::INT32, Device::MPS),

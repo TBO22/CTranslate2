@@ -61,7 +61,7 @@ kernel void moe_offsets(device uint* offsets [[buffer(0)]], device uint* indirec
       const uint columns = stage ? a.hidden : a.intermediate;
       const uint at = (e*2+stage)*3;
       const uint bm = a.decode == 1 ? 1 : a.decode == 2 ? 64 : 16;
-      const uint bn = a.decode == 1 ? 8 : a.decode == 2 ? 64 : 32;
+      const uint bn = a.decode == 1 ? 8 : a.decode >= 2 ? 64 : 32;
       indirect[at] = count ? (columns+bn-1)/bn : 1;
       indirect[at+1] = count ? (count+bm-1)/bm : 1;
       indirect[at+2] = 1;

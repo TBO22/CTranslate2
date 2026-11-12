@@ -114,12 +114,10 @@ void moe_dispatch_plan(const int32_t* ids, int32_t* offsets,
   struct Args {
     uint32_t tokens, experts, topk, hidden, intermediate, decode;
   };
-  const Args args{uint32_t(rows),
-                  uint32_t(experts),
-                  uint32_t(topk),
-                  uint32_t(hidden),
-                  uint32_t(intermediate),
-                  decode ? 1u : wide ? 2u : 0u};
+  const Args args{
+      uint32_t(rows),         uint32_t(experts),
+      uint32_t(topk),         uint32_t(hidden),
+      uint32_t(intermediate), decode ? 1u : wide ? (rows < 64 ? 3u : 2u) : 0u};
   const size_t assignment_bytes = size_t(rows) * topk * sizeof(int32_t);
   const size_t offset_bytes = size_t(experts + 1) * sizeof(int32_t);
   static const bool disable_small = [] {
@@ -179,6 +177,9 @@ void moe_expert_project(DataType dtype, const void* input, const void* gate,
   if (wide && (decode || dtype != DataType::FLOAT16))
     throw std::invalid_argument("Wide MPS MoE tiles require FP16 GEMM");
   const char* kernel = decode ? "moe_expert_gemv"
+                       : wide && rows < 64
+                           ? (gated ? "moe_expert_gate_up_f16_16x64"
+                                    : "moe_expert_down_f16_16x64")
                        : wide ? (gated ? "moe_expert_gate_up_f16_64x64"
                                        : "moe_expert_down_f16_64x64")
                               : "moe_expert_gemm";

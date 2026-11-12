@@ -39,6 +39,7 @@ def test_real_decoder_repeated_prefill_logits_are_finite(
         "CT2_MPS_DISABLE_COOPERATIVE_QK",
         "CT2_MPS_DISABLE_VECTOR_MOE",
         "CT2_MPS_DISABLE_SMALL_MOE_PLAN",
+        "CT2_MPS_DISABLE_SHORT_MOE_GEMM",
     ):
         environment.pop(name, None)
     result = subprocess.run(
@@ -113,6 +114,7 @@ print(json.dumps([result.sequences_ids[0] for result in results]))
             "CT2_MPS_DISABLE_COOPERATIVE_QK",
             "CT2_MPS_DISABLE_VECTOR_MOE",
             "CT2_MPS_DISABLE_SMALL_MOE_PLAN",
+            "CT2_MPS_DISABLE_SHORT_MOE_GEMM",
         ):
             environment.pop(name)
     for device in ("cpu", "mps"):
