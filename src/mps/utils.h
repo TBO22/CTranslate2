@@ -14,6 +14,37 @@ namespace ctranslate2 {
     void set_device_index(int index);
     void flush();
     void synchronize(const char* reason = nullptr, size_t bytes = 0);
+    // Wait for pending work on every thread-local MPS stream. This is the
+    // device-wide counterpart to synchronize(), which only waits for the
+    // calling thread's stream.
+    void synchronize_all();
+
+    // A failed command buffer is an error of the stream that submitted it:
+    // only that stream's next synchronize() or command_buffer() throws it, and
+    // it is thrown once. synchronize_all() throws the error of one stream that
+    // has one, also once.
+    //
+    // The variants below wait like synchronize() and synchronize_all() but
+    // never throw, for code that cannot report an error: a worker thread going
+    // idle and the destructor of a Model. A failure is logged once and stays
+    // on its stream, so the next real operation on that stream raises it.
+    void synchronize_nothrow() noexcept;
+    void synchronize_all_nothrow() noexcept;
+
+    // Serializes a complete kernel encoding sequence with device-wide
+    // synchronization. MPS streams are thread-local, so this lock is
+    // uncontended during normal inference.
+    class StreamGuard {
+    public:
+      StreamGuard();
+      ~StreamGuard();
+
+      StreamGuard(const StreamGuard&) = delete;
+      StreamGuard& operator=(const StreamGuard&) = delete;
+
+    private:
+      void* _stream;
+    };
 
     void* allocate_buffer(size_t size);
     void free_buffer(void* ptr);

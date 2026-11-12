@@ -141,7 +141,8 @@ namespace ctranslate2 {
 #ifdef CT2_WITH_MPS
     if (device == Device::MPS) {
       const ScopedDeviceSetter scoped_device_setter(device, index);
-      mps::synchronize();
+      // Model destruction waits for every producer stream and cannot throw.
+      mps::synchronize_all_nothrow();
     }
 #endif
 #if !defined(CT2_WITH_CUDA) && !defined(CT2_WITH_MPS)
@@ -163,6 +164,16 @@ namespace ctranslate2 {
 #if !defined(CT2_WITH_CUDA) && !defined(CT2_WITH_MPS)
     (void)device;
 #endif
+  }
+
+  void synchronize_stream_nothrow(Device device) {
+#ifdef CT2_WITH_MPS
+    if (device == Device::MPS) {
+      mps::synchronize_nothrow();
+      return;
+    }
+#endif
+    synchronize_stream(device);
   }
 
   void destroy_context(Device device) {

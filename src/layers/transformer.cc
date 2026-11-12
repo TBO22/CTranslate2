@@ -12,9 +12,10 @@ namespace ctranslate2 {
       : _layer_norm(build_optional_layer<LayerNorm>(model, scope + "/layer_norm"))
       , _pre_norm(pre_norm)
       , _activation_type(activation_type)
-      , _ff1(model, scope + "/linear_0", &_activation_type)
+      , _moe(model.layer_exists(scope + "/router") ? std::make_unique<MixtureOfExperts>(model, scope) : nullptr)
+      , _ff1(_moe ? nullptr : std::make_unique<Dense>(model, scope + "/linear_0", &_activation_type))
       , _ff1_noact(build_optional_layer<Dense>(model, scope + "/linear_0_noact"))
-      , _ff2(model, scope + "/linear_1", nullptr, true)
+      , _ff2(_moe ? nullptr : std::make_unique<Dense>(model, scope + "/linear_1", nullptr, true))
       , _tensor_parallel(model.tensor_parallel()) {
     }
 
@@ -29,7 +30,17 @@ namespace ctranslate2 {
       const DataType dtype = input.dtype();
 
       StorageView inner(dtype, device);
-      _ff1(*x, inner);
+      if (_moe) {
+        (*_moe)(*x, inner);
+        if (_layer_norm)
+          ops::Add()(inner, input, output);
+        else
+          output = std::move(inner);
+        if (_layer_norm && !_pre_norm)
+          (*_layer_norm)(output, output);
+        return;
+      }
+      (*_ff1)(*x, inner);
       if (_ff1_noact) {
         StorageView linear(dtype, device);
         (*_ff1_noact)(*x, linear);
@@ -38,9 +49,9 @@ namespace ctranslate2 {
 
       const bool fuse_post_norm = _layer_norm && !_pre_norm && !_tensor_parallel;
       if (fuse_post_norm)
-        _ff2.forward_with_post_layer_norm(inner, input, *_layer_norm, output);
+        _ff2->forward_with_post_layer_norm(inner, input, *_layer_norm, output);
       else
-        _ff2(inner, output, _layer_norm ? &input : nullptr);
+        (*_ff2)(inner, output, _layer_norm ? &input : nullptr);
 
       if (_tensor_parallel) {
         Shape shape = output.shape();
@@ -515,6 +526,7 @@ namespace ctranslate2 {
                           : build_position_encoder(model, scope + "/position_encodings", _embeddings))
       , _with_encoder_attention(_layers.front()->has_cross_attention())
       , _proj(model, scope + "/projection")
+      , _fp32_logits(!_with_encoder_attention && _proj.supports_float32_output())
       , _sliding_window(model.get_attribute_with_default<int32_t>(scope + "/sliding_window", 0))
       , _tensor_parallel(model.tensor_parallel())
       , _final_logit_softcapping(model.get_attribute_with_default<float>(scope + "/final_logit_softcapping", 0.f)) {
@@ -672,7 +684,7 @@ namespace ctranslate2 {
         lengths = input_lengths.get();
       }
 
-      bool multi_query = _layers.front()->get_self_attention().multi_query();
+      bool multi_query = _layers.front()->get_self_attention().interleaved_length_mask();
 
       if (lengths) {
         if (allow_padding_removal) {
@@ -855,7 +867,10 @@ namespace ctranslate2 {
           ops::Mul()(layer_in, *_outputs_scale, layer_in);
 
         if (return_logits) {
-          _proj(layer_in, *outputs);
+          if (_fp32_logits)
+            _proj.forward_float32(layer_in, *outputs);
+          else
+            _proj(layer_in, *outputs);
           if (_final_logit_softcapping != 0.f) {
             // logits = tanh(logits / cap) * cap  — squashes logits to (-cap, cap)
             const auto dtype = outputs->dtype();

@@ -349,7 +349,8 @@ namespace ctranslate2 {
     void idle() override {
       // When no new jobs are immediately available, we synchronize the CUDA stream
       // so that the CudaAsyncAllocator can release some memory.
-      synchronize_stream(_device);
+      // Outside a job, retain MPS errors for the next operation on this stream.
+      synchronize_stream_nothrow(_device);
     }
 
     void finalize() override {

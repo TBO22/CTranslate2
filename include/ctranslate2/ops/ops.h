@@ -46,3 +46,5 @@
 #include "awq/dequantize_awq.h"
 #endif
 #include "sum.h"
+#include "fused_attention.h"
+#include "moe_topk.h"

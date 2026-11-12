@@ -27,6 +27,9 @@ namespace ctranslate2 {
 
   void synchronize_device(Device device, int index);
   void synchronize_stream(Device device);
+  // Keep asynchronous MPS failures on their owning stream for the next job;
+  // idle worker cleanup must not throw outside the job exception boundary.
+  void synchronize_stream_nothrow(Device device);
 
   void destroy_context(Device device);
 

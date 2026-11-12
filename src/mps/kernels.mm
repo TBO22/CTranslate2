@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "mps/kernels.h"
+#include "ctranslate2/profiler.h"
 #include "mps/utils.h"
 #include "ctranslate2/random.h"
 
@@ -97,6 +98,12 @@ struct MeanArgs {
   uint get_sum;
 };
 
+struct StreamingAttentionArgs {
+  uint batch_size, query_heads, kv_heads, query_length, key_length, depth;
+  uint has_lengths, causal, query_offset, window, bf16, interleaved;
+  float scale;
+};
+
 struct NormArgs {
   ulong outer_size;
   ulong axis_size;
@@ -113,6 +120,7 @@ struct RotaryArgs {
   ulong ndims;
   ulong depth;
   uint interleave;
+  uint interleaved_heads;
 };
 
 struct Im2Col1DArgs {
@@ -1305,7 +1313,12 @@ TOP_P_MASK_KERNEL(top_p_mask_f32, float, load_value<float>, store_value<float>)
 TOP_P_MASK_KERNEL(top_p_mask_f16, half, load_value<half>, store_value<half>)
 TOP_P_MASK_KERNEL(top_p_mask_bf16, ushort, load_value_bf16, store_value_bf16)
 
-#define SMALL_TOPK_KERNEL(NAME, TYPE, LOAD, STORE)                                    \
+// TopK for k <= 16. A row with fewer than k finite candidates (a beam search
+// masks tokens to -inf or the lowest value) still returns every masked
+// candidate with its real value and index: the initial -INFINITY/UINT_MAX
+// slots lose to a masked candidate on index, so the exhausted ranks are filled
+// by the masked input instead of by padding.
+#define SMALL_TOPK_KERNEL(NAME, TYPE, LOAD, STORE, MAX_K)                             \
 kernel void NAME(device const TYPE* input [[buffer(0)]],                              \
                  device TYPE* values [[buffer(1)]],                                   \
                  device int* indices [[buffer(2)]],                                   \
@@ -1316,9 +1329,9 @@ kernel void NAME(device const TYPE* input [[buffer(0)]],                        
                  uint tid [[thread_index_in_threadgroup]],                            \
                  uint nt [[threads_per_threadgroup]]) {                               \
   if (row >= args.batch_size) return;                                                  \
-  float local_values[8];                                                              \
-  uint local_indices[8];                                                              \
-  for (uint rank = 0; rank < 8; ++rank) {                                             \
+  float local_values[MAX_K];                                                          \
+  uint local_indices[MAX_K];                                                          \
+  for (uint rank = 0; rank < MAX_K; ++rank) {                                         \
     local_values[rank] = -INFINITY;                                                   \
     local_indices[rank] = UINT_MAX;                                                   \
   }                                                                                   \
@@ -1372,9 +1385,12 @@ kernel void NAME(device const TYPE* input [[buffer(0)]],                        
   }                                                                                   \
 }
 
-SMALL_TOPK_KERNEL(small_topk_f32, float, load_value<float>, store_value<float>)
-SMALL_TOPK_KERNEL(small_topk_f16, half, load_value<half>, store_value<half>)
-SMALL_TOPK_KERNEL(small_topk_bf16, ushort, load_value_bf16, store_value_bf16)
+SMALL_TOPK_KERNEL(small_topk_f32, float, load_value<float>, store_value<float>, 8)
+SMALL_TOPK_KERNEL(small_topk_f16, half, load_value<half>, store_value<half>, 8)
+SMALL_TOPK_KERNEL(small_topk_bf16, ushort, load_value_bf16, store_value_bf16, 8)
+SMALL_TOPK_KERNEL(small_topk_16_f32, float, load_value<float>, store_value<float>, 16)
+SMALL_TOPK_KERNEL(small_topk_16_f16, half, load_value<half>, store_value<half>, 16)
+SMALL_TOPK_KERNEL(small_topk_16_bf16, ushort, load_value_bf16, store_value_bf16, 16)
 
 // Fused deterministic beam-search selection. One threadgroup owns a model
 // batch row and processes all beams. The FP16 rounding after log-softmax and
@@ -2491,6 +2507,120 @@ kernel void fused_attention_f16(
   }
 }
 
+inline float attention_value(ushort value, bool bf16) {
+  return bf16 ? as_type<float>(uint(value) << 16) : float(as_type<half>(value));
+}
+
+// Four query rows share a 32-key K/V tile. Each SIMD group owns one query,
+// reduces QK in FP32 and keeps its output numerator in registers. The running
+// maximum/denominator rescale previous tiles: softmax never sees an unbounded
+// exponential and no scores/probabilities are stored in device memory.
+kernel void streaming_attention_16(
+    device const ushort* queries [[buffer(0)]],
+    device const ushort* keys [[buffer(1)]],
+    device const ushort* values [[buffer(2)]],
+    device const int* lengths [[buffer(3)]],
+    device ushort* output [[buffer(4)]],
+    constant StreamingAttentionArgs& args [[buffer(5)]],
+    threadgroup ushort* tile [[threadgroup(0)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+  const uint matrix = group.y;
+  const uint batch = matrix / args.query_heads;
+  const uint head = matrix % args.query_heads;
+  const uint kv_head = head / (args.query_heads / args.kv_heads);
+  const uint query_row = group.x * 4 + simd;
+  const bool active = query_row < args.query_length;
+  const ulong qbase = args.interleaved
+    ? ((ulong(batch) * args.query_length + query_row) * args.query_heads + head) * args.depth
+    : (ulong(matrix) * args.query_length + query_row) * args.depth;
+  const ulong kvbase = (ulong(batch) * args.kv_heads + kv_head) * args.key_length * args.depth;
+  uint valid = args.key_length;
+  if (active && args.has_lengths)
+    valid = uint(clamp(lengths[ulong(matrix) * args.query_length + query_row], 0, int(args.key_length)));
+  const uint position = args.query_offset + query_row;
+  if (args.causal)
+    valid = min(valid, position + 1);
+  const uint first = args.window && position + 1 > args.window ? position + 1 - args.window : 0;
+  uint tile_end = args.key_length;
+  if (args.causal)
+    tile_end = min(tile_end, args.query_offset + min(group.x * 4 + 3, args.query_length - 1) + 1);
+  const uint first_position = args.query_offset + group.x * 4;
+  const uint tile_start = args.window && first_position + 1 > args.window
+    ? (first_position + 1 - args.window) / 32 * 32 : 0;
+  float q[8], accumulator[8];
+  for (uint i = 0; i < 8; ++i) {
+    const uint d = lane + i * 32;
+    q[i] = active && d < args.depth ? attention_value(queries[qbase + d], args.bf16) : 0;
+    accumulator[i] = 0;
+  }
+  float maximum = -INFINITY;
+  float denominator = 0;
+  const uint tile_size = 32 * args.depth;
+  for (uint base = tile_start; base < tile_end; base += 32) {
+    for (uint i = tid; i < tile_size; i += 128) {
+      const uint key = base + i / args.depth;
+      const ulong index = kvbase + ulong(key) * args.depth + i % args.depth;
+      tile[i] = key < args.key_length ? keys[index] : ushort(0);
+      tile[tile_size + i] = key < args.key_length ? values[index] : ushort(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active) {
+      float lane_score = -INFINITY;
+      for (uint j = 0; j < 32; ++j) {
+        float partial = 0;
+        if (base + j >= first && base + j < valid) {
+          for (uint i = 0; i < 8; ++i) {
+            const uint d = lane + i * 32;
+            if (d < args.depth)
+              partial = fma(q[i], attention_value(tile[j * args.depth + d], args.bf16), partial);
+          }
+        }
+        const float score = simd_sum(partial) * args.scale;
+        if (lane == j && base + j >= first && base + j < valid)
+          lane_score = score;
+      }
+      const float tile_maximum = simd_max(lane_score);
+      if (tile_maximum != -INFINITY) {
+        const float next_maximum = max(maximum, tile_maximum);
+        const float correction = maximum == -INFINITY ? 0 : exp(maximum - next_maximum);
+        const float probability = lane_score == -INFINITY ? 0 : exp(lane_score - next_maximum);
+        denominator = denominator * correction + simd_sum(probability);
+        for (uint i = 0; i < 8; ++i)
+          accumulator[i] *= correction;
+        for (uint j = 0; j < 32; ++j) {
+          const float p = simd_shuffle(probability, j);
+          // Masked values may be uninitialized or nonfinite. Do not multiply
+          // them by zero: IEEE 0 * NaN would corrupt an otherwise valid row.
+          if (base + j < first || base + j >= valid)
+            continue;
+          for (uint i = 0; i < 8; ++i) {
+            const uint d = lane + i * 32;
+            if (d < args.depth)
+              accumulator[i] = fma(p, attention_value(tile[tile_size + j * args.depth + d], args.bf16), accumulator[i]);
+          }
+        }
+        maximum = next_maximum;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (active) {
+    for (uint i = 0; i < 8; ++i) {
+      const uint d = lane + i * 32;
+      if (d < args.depth) {
+        const float result = denominator > 0 ? accumulator[i] / denominator : 0;
+        if (args.bf16)
+          store_value_bf16(output, qbase + d, result);
+        else
+          output[qbase + d] = as_type<ushort>(half(result));
+      }
+    }
+  }
+}
+
 #define MEAN_KERNEL(NAME, TYPE, LOAD, STORE)                                           \
 kernel void NAME(device const TYPE* x [[buffer(0)]],                                   \
                  device TYPE* y [[buffer(1)]],                                         \
@@ -2734,7 +2864,7 @@ kernel void NAME(device const TYPE* input [[buffer(0)]],                        
   ulong idx = (ulong)gid;                                                              \
   if (idx >= args.size) return;                                                        \
   ulong i = idx % args.depth;                                                          \
-  ulong t = (idx / args.depth) % args.max_time;                                        \
+  ulong t = (idx / args.depth / args.interleaved_heads) % args.max_time;                                        \
   if (i >= args.ndims) {                                                               \
     output[idx] = input[idx];                                                          \
     return;                                                                            \
@@ -2789,7 +2919,15 @@ IM2COL_KERNEL(im2col_conv1d_f32, float)
 IM2COL_KERNEL(im2col_conv1d_f16, half)
 IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
 
-)METAL";
+)METAL"
+#include "mps/flash_attention_metal.h"
+#include "mps/flash_prefill_metal.h"
+#include "mps/moe_metal.h"
+#include "mps/moe_expert_metal.h"
+#include "mps/moe_prefill_metal.h"
+#include "mps/mixed_gemm_metal.h"
+#include "mps/int4_metal.h"
+;
 
       struct ElementwiseArgs {
         uint64_t size;
@@ -2857,6 +2995,12 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
         uint32_t get_sum;
       };
 
+      struct StreamingAttentionArgs {
+        uint32_t batch_size, query_heads, kv_heads, query_length, key_length, depth;
+        uint32_t has_lengths, causal, query_offset, window, bf16, interleaved;
+        float scale;
+      };
+
       struct NormArgs {
         uint64_t outer_size;
         uint64_t axis_size;
@@ -2873,6 +3017,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
         uint64_t ndims;
         uint64_t depth;
         uint32_t interleave;
+        uint32_t interleaved_heads;
       };
 
       struct Im2Col1DArgs {
@@ -3226,6 +3371,9 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
       }
 
       static id<MTLComputePipelineState> pipeline(const std::string& name) {
+        // Libraries and compute pipeline states are immutable and thread safe,
+        // so one instance is shared by all threads (unlike MPSKernel objects,
+        // see gemm_kernel()).
         static std::unordered_map<std::string, id<MTLComputePipelineState>> cache;
         static std::mutex cache_mutex;
         static thread_local std::unordered_map<std::string, id<MTLComputePipelineState>> local_cache;
@@ -3532,6 +3680,23 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
         return bits;
       }
 
+      // The MPSMatrixMultiplication kernels of one thread. The thread owns every
+      // kernel in the map and releases it when the thread ends.
+      struct GemmKernelCache {
+        std::unordered_map<GemmKey, MPSMatrixMultiplication*, GemmKeyHash> kernels;
+
+        GemmKernelCache() = default;
+        GemmKernelCache(const GemmKernelCache&) = delete;
+        GemmKernelCache& operator=(const GemmKernelCache&) = delete;
+
+        ~GemmKernelCache() {
+#if !__has_feature(objc_arc)
+          for (auto& entry : kernels)
+            [entry.second release];
+#endif
+        }
+      };
+
       static MPSMatrixMultiplication* gemm_kernel(id<MTLDevice> device,
                                                   DataType dtype,
                                                   bool transpose_a,
@@ -3542,11 +3707,14 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                                   dim_t batch_size,
                                                   float alpha,
                                                   float beta) {
-        static std::unordered_map<GemmKey, MPSMatrixMultiplication*, GemmKeyHash> cache;
-        static std::mutex cache_mutex;
-        static thread_local std::unordered_map<GemmKey,
-                                               MPSMatrixMultiplication*,
-                                               GemmKeyHash> local_cache;
+        // One kernel per thread, not one per process. Apple documents MPSKernel
+        // objects as not safe to use from several threads at once (each thread
+        // should have its own copy), and encoding one builds and updates state
+        // inside it. Workers of the same translator run the same GEMM shapes,
+        // and sharing one MPSMatrixMultiplication between them crashed with a
+        // SIGSEGV inside MPSSetNDArraysOnComputeEncoder. Nothing in this map is
+        // ever visible to another thread.
+        static thread_local GemmKernelCache cache;
 
         const GemmKey key{dtype,
                           transpose_a,
@@ -3558,16 +3726,9 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                           float_bits(alpha),
                           float_bits(beta)};
 
-        auto local_it = local_cache.find(key);
-        if (local_it != local_cache.end())
-          return local_it->second;
-
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        auto it = cache.find(key);
-        if (it != cache.end()) {
-          local_cache.emplace(key, it->second);
+        auto it = cache.kernels.find(key);
+        if (it != cache.kernels.end())
           return it->second;
-        }
 
         MPSMatrixMultiplication* matmul =
           [[MPSMatrixMultiplication alloc] initWithDevice:device
@@ -3578,9 +3739,11 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                           interiorColumns:static_cast<NSUInteger>(k)
                                                     alpha:alpha
                                                      beta:beta];
+        if (!matmul)
+          throw std::runtime_error("failed to create MPS matrix multiplication kernel");
         [matmul setBatchSize:static_cast<NSUInteger>(batch_size)];
-        cache.emplace(key, matmul);
-        local_cache.emplace(key, matmul);
+        // The map takes over the reference returned by alloc.
+        cache.kernels.emplace(key, matmul);
         return matmul;
       }
 
@@ -3588,22 +3751,6 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
         static const bool enabled = []() {
           const char* value = std::getenv("CT2_MPS_LOG_GEMM");
           return value && value[0] != '\0' && std::string(value) != "0";
-        }();
-        return enabled;
-      }
-
-      static bool custom_gemv_enabled() {
-        static const bool enabled = []() {
-          const char* value = std::getenv("CT2_MPS_USE_GEMV");
-          return !value || value[0] == '\0' || std::string(value) != "0";
-        }();
-        return enabled;
-      }
-
-      static bool gpu_topk_enabled() {
-        static const bool enabled = []() {
-          const char* value = std::getenv("CT2_MPS_USE_TOPK");
-          return !value || value[0] == '\0' || std::string(value) != "0";
         }();
         return enabled;
       }
@@ -3701,6 +3848,42 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
         return value && value[0] != '\0' && value[0] != '0';
       }();
       return enabled;
+    }
+
+    static bool simdgroup_gemm_layout_supported(const void* a,
+                                                dim_t lda,
+                                                const void* b,
+                                                dim_t ldb,
+                                                dim_t m,
+                                                dim_t n,
+                                                dim_t k,
+                                                dim_t ldc) {
+      // The vector copies require 16-byte row alignment and the Metal kernel
+      // uses 32-bit element indices. Check spans as well as individual strides.
+      if (m < 64 || n <= 0 || k <= 0 || lda < k || ldb < k || ldc < n
+          || !fits_u32(m) || !fits_u32(n) || !fits_u32(k)
+          || !fits_u32(lda) || !fits_u32(ldb) || !fits_u32(ldc)
+          || lda % 8 != 0 || ldb % 8 != 0
+          || (reinterpret_cast<uintptr_t>(a) & 15u) != 0
+          || (reinterpret_cast<uintptr_t>(b) & 15u) != 0
+          || uint64_t(m - 1) * lda + k > UINT32_MAX
+          || uint64_t(n - 1) * ldb + k > UINT32_MAX
+          || uint64_t(m - 1) * ldc + n > UINT32_MAX)
+        return false;
+      static const bool supported = []() {
+        id<MTLDevice> device = (__bridge id<MTLDevice>)get_device();
+        return device && [device supportsFamily:MTLGPUFamilyApple7];
+      }();
+      return supported;
+    }
+
+    static bool needs_native_prefill_gemm(dim_t m, dim_t n, dim_t k, float beta) {
+      // Repeated real Qwen prefill on M1/macOS 27 produced NaNs inside
+      // MPSMatrixMultiplication with finite operands. Bypass that large dense
+      // projection path using the existing FP32-accumulating native kernel.
+      // Keep small projections and other GEMM configurations on their existing
+      // paths; this is a correctness workaround, not a driver root-cause claim.
+      return m >= 1024 && n >= 1024 && k >= 1024 && beta == 0.f;
     }
 
     static void simdgroup_gemm_nt_f16(dim_t m,
@@ -4035,6 +4218,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                    float beta,
                    int32_t* c,
                    dim_t ldc) {
+      StreamGuard stream_guard;
       int8_gemm_impl(transpose_a, transpose_b, m, n, k, alpha,
                      a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
     }
@@ -4050,6 +4234,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                              dim_t n,
                                              dim_t k,
                                              int activation) {
+      StreamGuard stream_guard;
       static const bool enabled = []() {
         const char* value = std::getenv("CT2_MPS_USE_WEIGHT_ONLY_INT8");
         return !value || value[0] == '\0' || std::string(value) != "0";
@@ -4171,6 +4356,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                  dim_t ldc,
                                  dim_t stridec,
                                  dim_t batch_size) {
+      StreamGuard stream_guard;
       int8_gemm_impl(transpose_a, transpose_b, m, n, k, alpha,
                      a, lda, stridea, b, ldb, strideb, beta,
                      c, ldc, stridec, batch_size);
@@ -4193,6 +4379,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               dim_t ldc,
               dim_t stridec,
               dim_t batch_size) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || m == 0)
         return;
       if (dtype != DataType::FLOAT32 && dtype != DataType::FLOAT16 && dtype != DataType::BFLOAT16)
@@ -4255,6 +4442,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                   const void* bias,
                   const void* residual,
                   int activation) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || n == 0)
         return;
       if (dtype != DataType::FLOAT32 && dtype != DataType::FLOAT16 && dtype != DataType::BFLOAT16)
@@ -4370,6 +4558,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                             const void* bias,
                             const void* residual,
                             int activation) {
+      StreamGuard stream_guard;
       if (dtype == DataType::FLOAT16
           && !transpose_a
           && transpose_b
@@ -4388,9 +4577,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
           || dtype != DataType::FLOAT16
           || transpose_a
           || !transpose_b
-          || m < 64
-          || !fits_u32(m) || !fits_u32(n) || !fits_u32(k)
-          || !fits_u32(lda) || !fits_u32(ldb) || !fits_u32(ldc))
+          || !simdgroup_gemm_layout_supported(a, lda, b, ldb, m, n, k, ldc))
         return false;
 
       log_gemm(dtype, transpose_a, transpose_b, m, n, k, lda, ldb, ldc,
@@ -4415,11 +4602,12 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               float beta,
               void* c,
               dim_t ldc) {
+      StreamGuard stream_guard;
       if (!supports_gemm_type(dtype))
         throw std::invalid_argument("unsupported MPS GEMM dtype");
       if (m == 0 || n == 0)
         return;
-      if (m == 1 && custom_gemv_enabled()) {
+      if (m == 1) {
         log_gemm(dtype, transpose_a, transpose_b, m, n, k, lda, ldb, ldc,
                  1, 0, 0, 0, "row_gemv");
         gemv_row(dtype,
@@ -4441,7 +4629,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                  1);
         return;
       }
-      if (n == 1 && custom_gemv_enabled()) {
+      if (n == 1) {
         log_gemm(dtype, transpose_a, transpose_b, m, n, k, lda, ldb, ldc,
                  1, 0, 0, 0, "column_gemv");
         gemv(dtype,
@@ -4478,22 +4666,31 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
         return;
       }
 
-      // CTranslate2 Dense weights use the output-major [N, K] layout. On
-      // Apple Silicon, MPSMatrixMultiplication leaves substantial throughput
-      // on the table for these medium-M FP16 projections (especially the
-      // vocabulary projection). Keep this opt-in while its shape thresholds
-      // are benchmarked across supported GPU generations.
-      if (simdgroup_gemm_enabled()
-          && dtype == DataType::FLOAT16
+      // CTranslate2 Dense weights use the output-major [N, K] layout. Large
+      // prefill projections need the native path for correctness. The wider
+      // medium-M tuning range remains opt-in and is not an automatic epilogue
+      // fusion: keep the established separate bias/activation boundaries.
+      if (dtype == DataType::FLOAT16
           && !transpose_a
           && transpose_b
-          && m >= 64
-          && fits_u32(m) && fits_u32(n) && fits_u32(k)
-          && fits_u32(lda) && fits_u32(ldb) && fits_u32(ldc)) {
+          && (needs_native_prefill_gemm(m, n, k, beta) || simdgroup_gemm_enabled())
+          && simdgroup_gemm_layout_supported(a, lda, b, ldb, m, n, k, ldc)) {
         log_gemm(dtype, transpose_a, transpose_b, m, n, k, lda, ldb, ldc,
                  1, 0, 0, 0, "simdgroup_nt_f16");
         simdgroup_gemm_nt_f16(m, n, k, alpha,
                               a, lda, b, ldb, beta, c, ldc);
+        return;
+      }
+
+      if (dtype == DataType::FLOAT16 && !transpose_a && transpose_b
+          && needs_native_prefill_gemm(m, n, k, beta)) {
+        // Unsupported SIMD-group hardware, alignment or index spans must not
+        // silently re-enter the affected MPSMatrix route. The scalar tiled
+        // Metal implementation supports these layouts without host copies.
+        log_gemm(dtype, transpose_a, transpose_b, m, n, k, lda, ldb, ldc,
+                 1, 0, 0, 0, "generic_prefill_fallback");
+        generic_gemm(dtype, transpose_a, transpose_b, m, n, k, alpha,
+                     a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
         return;
       }
 
@@ -4578,6 +4775,10 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                                       1,
                                                       alpha,
                                                       beta);
+        // The kernel is owned by this thread's cache and goes away with the
+        // thread, possibly before the command buffer it was encoded into has
+        // run. Hold it until then, like the matrices above.
+        record_metal_object_use((__bridge void*)matmul);
 
         end_active_encoder();
         id<MTLCommandBuffer> active_command_buffer =
@@ -4615,9 +4816,10 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                             dim_t ldc,
                             dim_t stridec,
                             dim_t batch_size) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || m == 0 || n == 0)
         return;
-      if (m == 1 && custom_gemv_enabled()) {
+      if (m == 1) {
         log_gemm(dtype, transpose_a, transpose_b, m, n, k, lda, ldb, ldc,
                  batch_size, stridea, strideb, stridec, "batched_row_gemv");
         gemv_row(dtype,
@@ -4639,7 +4841,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                  batch_size);
         return;
       }
-      if (n == 1 && custom_gemv_enabled()) {
+      if (n == 1) {
         log_gemm(dtype, transpose_a, transpose_b, m, n, k, lda, ldb, ldc,
                  batch_size, stridea, strideb, stridec, "batched_column_gemv");
         gemv(dtype,
@@ -4783,6 +4985,8 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                                       batch_size,
                                                       alpha,
                                                       beta);
+        // See gemm(): the kernel must outlive the encoded work, not the thread.
+        record_metal_object_use((__bridge void*)matmul);
 
         end_active_encoder();
         id<MTLCommandBuffer> active_command_buffer =
@@ -4803,19 +5007,18 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     bool supports_topk(DataType dtype, dim_t k) {
-      if (!gpu_topk_enabled()
-          || (dtype != DataType::FLOAT32
+      if ((dtype != DataType::FLOAT32
               && dtype != DataType::FLOAT16
               && dtype != DataType::BFLOAT16)
           || k <= 0
           || k > 16)
         return false;
-      // The custom reduction supports the search-critical k values without
-      // MPSMatrix's 16-byte result-row restriction. Larger aligned results use
-      // MPSMatrixFindTopK.
-      if (dtype == DataType::BFLOAT16)
-        return k <= 8;
-      return k <= 8 || (static_cast<size_t>(k) * dtype_size(dtype)) % 16 == 0;
+      // Every supported k goes through the custom kernels (argmax for k == 1,
+      // small_topk up to 16). MPSMatrixFindTopK is not used: when a row has
+      // fewer than k finite candidates it pads the exhausted slots with 0 and a
+      // bogus index instead of returning the masked input, and a beam search
+      // would read that 0 as the best score. It also needs 16-byte result rows.
+      return true;
     }
 
     static void argmax(DataType dtype,
@@ -4857,13 +5060,17 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                            dim_t batch_size,
                            dim_t depth,
                            dim_t k) {
-      if (batch_size > UINT32_MAX || depth > UINT32_MAX || k > 8)
+      if (batch_size > UINT32_MAX || depth > UINT32_MAX || k > 16)
         throw std::invalid_argument("small MPS TopK dimensions are too large");
       const size_t element_size = dtype_size(dtype);
       const SmallTopKArgs args{static_cast<uint32_t>(batch_size),
                                static_cast<uint32_t>(depth),
                                static_cast<uint32_t>(k)};
-      id<MTLComputePipelineState> state = pipeline(storage_kernel_name("small_topk", dtype));
+      // Keep the common k <= 8 path in an 8-slot kernel. Using 16 private
+      // values for every thread increases register pressure and materially
+      // slows down beam-4 decoding, which requests k == 8.
+      const char* kernel = k <= 8 ? "small_topk" : "small_topk_16";
+      id<MTLComputePipelineState> state = pipeline(storage_kernel_name(kernel, dtype));
       id<MTLComputeCommandEncoder> encoder =
         (__bridge id<MTLComputeCommandEncoder>)compute_encoder();
       [encoder setComputePipelineState:state];
@@ -4880,7 +5087,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
       [encoder dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(batch_size), 1, 1)
                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
       [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-      record_compute_dispatch(kernel_name("small_topk", dtype).c_str());
+      record_compute_dispatch(kernel_name(kernel, dtype).c_str());
       record_profile_event(ProfileEvent::TopKGpu);
     }
 
@@ -4891,6 +5098,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               dim_t batch_size,
               dim_t depth,
               dim_t k) {
+      StreamGuard stream_guard;
       if (!supports_topk(dtype, k))
         throw std::invalid_argument("unsupported MPS TopK configuration");
       if (batch_size == 0 || depth == 0 || k == 0)
@@ -4899,91 +5107,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
         argmax(dtype, input, values, indices, batch_size, depth);
         return;
       }
-      if (k <= 8) {
-        small_topk(dtype, input, values, indices, batch_size, depth, k);
-        return;
-      }
-
-      id<MTLDevice> device = (__bridge id<MTLDevice>)get_device();
-      if (!device)
-        throw std::runtime_error("MPS device/queue not available");
-
-      const size_t element_size = dtype_size(dtype);
-      NSUInteger input_offset = 0;
-      NSUInteger values_offset = 0;
-      NSUInteger indices_offset = 0;
-      id<MTLBuffer> input_buffer =
-        mtl_buffer(input, static_cast<size_t>(batch_size * depth) * element_size, input_offset);
-      id<MTLBuffer> values_buffer =
-        mtl_buffer(values, static_cast<size_t>(batch_size * k) * element_size, values_offset);
-      id<MTLBuffer> indices_buffer =
-        mtl_buffer(indices, static_cast<size_t>(batch_size * k) * sizeof(uint32_t), indices_offset);
-
-      @autoreleasepool {
-        MPSMatrixDescriptor* input_desc =
-          [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(batch_size)
-                                                columns:static_cast<NSUInteger>(depth)
-                                               rowBytes:static_cast<NSUInteger>(depth * element_size)
-                                               dataType:mps_matrix_data_type(dtype)];
-        MPSMatrixDescriptor* values_desc =
-          [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(batch_size)
-                                                columns:static_cast<NSUInteger>(k)
-                                               rowBytes:static_cast<NSUInteger>(k * element_size)
-                                               dataType:mps_matrix_data_type(dtype)];
-        MPSMatrixDescriptor* indices_desc =
-          [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(batch_size)
-                                                columns:static_cast<NSUInteger>(k)
-                                               rowBytes:static_cast<NSUInteger>(k * sizeof(uint32_t))
-                                               dataType:MPSDataTypeUInt32];
-        record_metal_object_use((__bridge void*)input_desc);
-        record_metal_object_use((__bridge void*)values_desc);
-        record_metal_object_use((__bridge void*)indices_desc);
-
-        MPSMatrix* input_matrix = [[MPSMatrix alloc] initWithBuffer:input_buffer
-                                                            offset:input_offset
-                                                        descriptor:input_desc];
-        MPSMatrix* values_matrix = [[MPSMatrix alloc] initWithBuffer:values_buffer
-                                                              offset:values_offset
-                                                          descriptor:values_desc];
-        MPSMatrix* indices_matrix = [[MPSMatrix alloc] initWithBuffer:indices_buffer
-                                                               offset:indices_offset
-                                                           descriptor:indices_desc];
-        record_metal_object_use((__bridge void*)input_matrix);
-        record_metal_object_use((__bridge void*)values_matrix);
-        record_metal_object_use((__bridge void*)indices_matrix);
-
-        static thread_local std::unordered_map<dim_t, MPSMatrixFindTopK*> topk_cache;
-        MPSMatrixFindTopK* topk_kernel = nil;
-        auto cache_it = topk_cache.find(k);
-        if (cache_it == topk_cache.end()) {
-          topk_kernel = [[MPSMatrixFindTopK alloc]
-            initWithDevice:device
-            numberOfTopKValues:static_cast<NSUInteger>(k)];
-          if (!topk_kernel)
-            throw std::runtime_error("failed to create MPS TopK kernel");
-          topk_cache.emplace(k, topk_kernel);
-        } else {
-          topk_kernel = cache_it->second;
-        }
-        topk_kernel.sourceRows = static_cast<NSUInteger>(batch_size);
-        topk_kernel.sourceColumns = static_cast<NSUInteger>(depth);
-
-        end_active_encoder();
-        id<MTLCommandBuffer> active_command_buffer =
-          (__bridge id<MTLCommandBuffer>)command_buffer();
-        [topk_kernel encodeToCommandBuffer:active_command_buffer
-                               inputMatrix:input_matrix
-                         resultIndexMatrix:indices_matrix
-                         resultValueMatrix:values_matrix];
-        record_compute_dispatch("mps_matrix_topk");
-        record_profile_event(ProfileEvent::TopKGpu);
-
-#if !__has_feature(objc_arc)
-        [input_matrix release];
-        [values_matrix release];
-        [indices_matrix release];
-#endif
-      }
+      small_topk(dtype, input, values, indices, batch_size, depth, k);
     }
 
     bool fused_beam_search_topk(DataType dtype,
@@ -4995,6 +5119,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                 dim_t beam_size,
                                 dim_t vocabulary_size,
                                 dim_t k) {
+      StreamGuard stream_guard;
       if (dtype != DataType::FLOAT16
           || !logits || !beam_scores || !values || !indices
           || batch_size <= 0 || batch_size > UINT32_MAX
@@ -5048,6 +5173,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void fill(DataType dtype, const void* value, void* y, dim_t size) {
+      StreamGuard stream_guard;
       if (size == 0)
         return;
 
@@ -5088,6 +5214,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                       void* y,
                       const int32_t* indices,
                       dim_t size) {
+      StreamGuard stream_guard;
       if (size == 0)
         return;
       if (size > UINT32_MAX)
@@ -5132,6 +5259,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                   dim_t batch_size,
                                   dim_t length,
                                   dim_t vocabulary_size) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || length <= 0 || vocabulary_size <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(batch_size)
@@ -5167,6 +5295,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                              bool mask_future,
                              bool multi_query,
                              int32_t* mask) {
+      StreamGuard stream_guard;
       if (!fits_u32(batch_size) || !fits_u32(num_heads) || !fits_u32(num_queries))
         throw std::invalid_argument("MPS length mask dimensions are too large");
       const uint64_t total = static_cast<uint64_t>(batch_size)
@@ -5187,18 +5316,21 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void unary(DataType dtype, UnaryOp op, const void* x, void* y, dim_t size) {
+      StreamGuard stream_guard;
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const ElementwiseArgs args{static_cast<uint64_t>(size), op_code(op), 0};
       run_1d(kernel_name("unary", dtype), size, {{x, bytes}, {y, bytes}}, &args, sizeof(args), 2);
     }
 
     void binary(DataType dtype, BinaryOp op, const void* a, const void* b, void* c, dim_t size) {
+      StreamGuard stream_guard;
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const ElementwiseArgs args{static_cast<uint64_t>(size), op_code(op), 0};
       run_1d(kernel_name("binary", dtype), size, {{a, bytes}, {b, bytes}, {c, bytes}}, &args, sizeof(args), 3);
     }
 
     void scalar(DataType dtype, BinaryOp op, float a, const void* x, void* y, dim_t size) {
+      StreamGuard stream_guard;
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const ElementwiseArgs args{static_cast<uint64_t>(size), op_code(op), a};
       run_1d(kernel_name("scalar", dtype), size, {{x, bytes}, {y, bytes}}, &args, sizeof(args), 2);
@@ -5211,6 +5343,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                   dim_t batch_size,
                   dim_t depth,
                   bool round_before_cast) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0)
         return;
       const size_t input_bytes = static_cast<size_t>(batch_size * depth) * dtype_size(dtype);
@@ -5234,6 +5367,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                     void* output,
                     dim_t batch_size,
                     dim_t depth) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(batch_size * depth);
@@ -5261,6 +5395,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                 dim_t batch_size,
                                 dim_t depth,
                                 int activation) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(batch_size * depth);
@@ -5294,6 +5429,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                 dim_t batch_stride,
                 dim_t num_indices,
                 dim_t num_indices_per_batch) {
+      StreamGuard stream_guard;
       if (num_indices == 0 || copy_size == 0)
         return;
       if (num_indices_per_batch <= 0 || num_indices % num_indices_per_batch != 0)
@@ -5379,6 +5515,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                  dim_t b_block_size,
                  void* output,
                  dim_t outer_size) {
+      StreamGuard stream_guard;
       if (outer_size <= 0 || a_block_size <= 0 || b_block_size <= 0)
         return;
       const size_t element_size = dtype_size(dtype);
@@ -5404,6 +5541,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                 void* b,
                 dim_t b_block_size,
                 dim_t outer_size) {
+      StreamGuard stream_guard;
       if (outer_size <= 0 || a_block_size <= 0 || b_block_size <= 0)
         return;
       const size_t element_size = dtype_size(dtype);
@@ -5431,6 +5569,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                 void* c,
                 dim_t c_block_size,
                 dim_t outer_size) {
+      StreamGuard stream_guard;
       if (outer_size <= 0 || a_block_size <= 0 || b_block_size <= 0 || c_block_size <= 0)
         return;
       const size_t element_size = dtype_size(dtype);
@@ -5458,6 +5597,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               dim_t outer_size,
               dim_t inner_size,
               dim_t num_tiles) {
+      StreamGuard stream_guard;
       const uint64_t output_size =
         static_cast<uint64_t>(outer_size * inner_size * num_tiles);
       if (output_size == 0)
@@ -5492,6 +5632,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                   dim_t value_size,
                   dim_t block,
                   int activation) {
+      StreamGuard stream_guard;
       if (value_size == 0)
         return;
       const size_t element_size = dtype_size(dtype);
@@ -5521,6 +5662,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                          void* c,
                          dim_t a_size,
                          dim_t b_size) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const BroadcastArgs args{static_cast<uint64_t>(a_size),
                                static_cast<uint64_t>(b_size),
@@ -5544,6 +5686,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                          void* c,
                          dim_t a_size,
                          dim_t b_size) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const BroadcastArgs args{static_cast<uint64_t>(a_size),
                                static_cast<uint64_t>(b_size),
@@ -5568,6 +5711,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                          dim_t block,
                          dim_t a_size,
                          dim_t b_size) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const BroadcastArgs args{static_cast<uint64_t>(a_size),
                                static_cast<uint64_t>(b_size),
@@ -5585,6 +5729,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void transpose_2d(DataType dtype, const void* a, dim_t rows, dim_t cols, void* b) {
+      StreamGuard stream_guard;
       const uint64_t size = static_cast<uint64_t>(rows * cols);
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const Transpose2DArgs args{static_cast<uint64_t>(rows), static_cast<uint64_t>(cols)};
@@ -5592,6 +5737,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void transpose_3d(DataType dtype, const void* a, const dim_t* dims, const dim_t* perm, void* b) {
+      StreamGuard stream_guard;
       const uint64_t size = static_cast<uint64_t>(dims[0] * dims[1] * dims[2]);
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       const TransposeNDArgs args{static_cast<uint64_t>(dims[0]),
@@ -5606,6 +5752,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
     }
 
     void transpose_4d(DataType dtype, const void* a, const dim_t* dims, const dim_t* perm, void* b) {
+      StreamGuard stream_guard;
       const uint64_t size = static_cast<uint64_t>(dims[0] * dims[1] * dims[2] * dims[3]);
       const size_t bytes = static_cast<size_t>(size) * dtype_size(dtype);
       if (profile_enabled()) {
@@ -5669,6 +5816,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                  dim_t batch_size,
                  dim_t depth,
                  bool log) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const size_t bytes = static_cast<size_t>(batch_size * depth) * element_size;
       const SoftmaxArgs args{static_cast<uint64_t>(batch_size),
@@ -5698,6 +5846,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                          dim_t depth,
                          float scale,
                          dim_t interleaved_num_heads) {
+      StreamGuard stream_guard;
       if (dtype != DataType::FLOAT16
           || batch_size <= 0
           || query_length <= 0
@@ -5773,6 +5922,94 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
       return true;
     }
 
+    bool streaming_attention(DataType dtype,
+                             const void* queries,
+                             const void* keys,
+                             const void* values,
+                             const int32_t* lengths,
+                             void* output,
+                             dim_t batch_size,
+                             dim_t query_heads,
+                             dim_t kv_heads,
+                             dim_t query_length,
+                             dim_t key_length,
+                             dim_t depth,
+                             float scale,
+                             bool causal,
+                             dim_t query_offset,
+                             dim_t window,
+                             bool interleaved) {
+      StreamGuard stream_guard;
+      if ((dtype != DataType::FLOAT16 && dtype != DataType::BFLOAT16)
+          || !queries || !keys || !values || !output
+          || batch_size <= 0 || query_heads <= 0 || kv_heads <= 0
+          || query_heads % kv_heads != 0 || query_length <= 0 || key_length <= 0
+          || depth <= 0 || depth > 256 || query_offset < 0 || window < 0
+          || (window && !causal) || !std::isfinite(scale)
+          || uint64_t(batch_size) > UINT32_MAX || uint64_t(query_heads) > UINT32_MAX
+          || uint64_t(kv_heads) > UINT32_MAX || uint64_t(query_length) > UINT32_MAX
+          || uint64_t(key_length) > INT32_MAX || uint64_t(query_offset) > UINT32_MAX
+          || uint64_t(batch_size) * query_heads > UINT32_MAX
+          || uint64_t(query_length) * depth > UINT32_MAX
+          || uint64_t(key_length) * depth > INT32_MAX
+          || uint64_t(query_offset) + query_length >= UINT32_MAX
+          || uint64_t(window) > UINT32_MAX)
+        return false;
+      const uint64_t matrices = uint64_t(batch_size) * query_heads;
+      const uint64_t kv_matrices = uint64_t(batch_size) * kv_heads;
+      const uint64_t q_span = uint64_t(query_length) * depth;
+      const uint64_t kv_span = uint64_t(key_length) * depth;
+      if (matrices > SIZE_MAX / sizeof(uint16_t) / q_span
+          || kv_matrices > SIZE_MAX / sizeof(uint16_t) / kv_span
+          || matrices > SIZE_MAX / sizeof(int32_t) / uint64_t(query_length))
+        return false;
+      const size_t query_bytes = matrices * q_span * sizeof(uint16_t);
+      const size_t kv_bytes = kv_matrices * kv_span * sizeof(uint16_t);
+      const size_t lengths_bytes = matrices * query_length * sizeof(int32_t);
+      const auto overlaps_output = [&](const void* source, size_t bytes) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(source);
+        const uintptr_t b = reinterpret_cast<uintptr_t>(output);
+        return a <= b ? b - a < bytes : a - b < query_bytes;
+      };
+      if (overlaps_output(keys, kv_bytes) || overlaps_output(values, kv_bytes)
+          || (queries != output && overlaps_output(queries, query_bytes))
+          || (lengths && overlaps_output(lengths, lengths_bytes)))
+        return false;
+      id<MTLComputePipelineState> state = pipeline("streaming_attention_16");
+      id<MTLDevice> device = (__bridge id<MTLDevice>)get_device();
+      const NSUInteger tile_bytes = 2 * 32 * static_cast<NSUInteger>(depth) * sizeof(uint16_t);
+      if (state.threadExecutionWidth != 32 || state.maxTotalThreadsPerThreadgroup < 128
+          || tile_bytes + state.staticThreadgroupMemoryLength > device.maxThreadgroupMemoryLength)
+        return false;
+      const StreamingAttentionArgs args{
+        uint32_t(batch_size), uint32_t(query_heads), uint32_t(kv_heads),
+        uint32_t(query_length), uint32_t(key_length), uint32_t(depth),
+        lengths ? 1u : 0u, causal ? 1u : 0u, uint32_t(query_offset), uint32_t(window),
+        dtype == DataType::BFLOAT16 ? 1u : 0u, interleaved ? 1u : 0u, scale,
+      };
+      id<MTLComputeCommandEncoder> encoder = (__bridge id<MTLComputeCommandEncoder>)compute_encoder();
+      [encoder setComputePipelineState:state];
+      set_buffer(encoder, queries, query_bytes, 0);
+      set_buffer(encoder, keys, kv_bytes, 1);
+      set_buffer(encoder, values, kv_bytes, 2);
+      set_buffer(encoder, lengths ? static_cast<const void*>(lengths) : queries,
+                 lengths ? lengths_bytes : sizeof(uint16_t), 3);
+      set_buffer(encoder, output, query_bytes, 4);
+      [encoder setBytes:&args length:sizeof(args) atIndex:5];
+      [encoder setThreadgroupMemoryLength:tile_bytes atIndex:0];
+      [encoder dispatchThreadgroups:MTLSizeMake((query_length + 3) / 4, matrices, 1)
+               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      record_compute_dispatch("streaming_attention_16");
+      record_profile_detail("streaming_attention_16");
+      return true;
+    }
+
+#include "mps/flash_attention_kernels.inc"
+#include "mps/moe_kernels.inc"
+#include "mps/mixed_gemm_kernels.inc"
+#include "mps/int4_kernels.inc"
+
     void mean(DataType dtype,
               const void* input,
               void* output,
@@ -5780,6 +6017,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
               dim_t axis_size,
               dim_t inner_size,
               bool get_sum) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const uint64_t output_size = static_cast<uint64_t>(outer_size * inner_size);
       const MeanArgs args{static_cast<uint64_t>(outer_size),
@@ -5815,6 +6053,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                     dim_t axis_size,
                     dim_t inner_size,
                     float epsilon) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const size_t tensor_bytes = static_cast<size_t>(outer_size * axis_size * inner_size) * element_size;
       const size_t param_bytes = static_cast<size_t>(axis_size) * element_size;
@@ -5849,6 +6088,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                                         dim_t rows,
                                         dim_t depth,
                                         float epsilon) {
+      StreamGuard stream_guard;
       if (dtype != DataType::FLOAT16
           || !input || !bias || !residual || !gamma || !beta || !output
           || rows <= 0 || depth <= 0)
@@ -5888,6 +6128,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                   dim_t depth,
                   float epsilon,
                   bool use_residual) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const size_t tensor_bytes = static_cast<size_t>(batch_size * depth) * element_size;
       const size_t gamma_bytes = static_cast<size_t>(depth) * element_size;
@@ -5916,14 +6157,17 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                 dim_t max_time,
                 dim_t ndims,
                 dim_t depth,
-                bool interleave) {
+                bool interleave,
+                dim_t interleaved_heads) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const uint64_t size = static_cast<uint64_t>(batch_size * max_time * depth);
       const RotaryArgs args{size,
                             static_cast<uint64_t>(max_time),
                             static_cast<uint64_t>(ndims),
                             static_cast<uint64_t>(depth),
-                            interleave ? 1u : 0u};
+                            interleave ? 1u : 0u,
+                            static_cast<uint32_t>(interleaved_heads)};
       run_1d(kernel_name("rotary", dtype),
              size,
              {{input, static_cast<size_t>(size) * element_size},
@@ -5949,6 +6193,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                        dim_t k,
                        dim_t in_batch_stride,
                        dim_t in_group_stride) {
+      StreamGuard stream_guard;
       const size_t element_size = dtype_size(dtype);
       const uint64_t total = static_cast<uint64_t>(batch_size * groups * output_length * k);
       const Im2Col1DArgs args{total,
@@ -5978,6 +6223,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                        dim_t rows,
                        dim_t depth,
                        dim_t width) {
+      StreamGuard stream_guard;
       if (rows <= 0 || depth <= 0)
         return;
       if (width <= 0 || (width & 1) == 0 || width > 129)
@@ -6019,6 +6265,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                     dim_t depth,
                     float probability,
                     float mask_value) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0)
         return;
       if (depth > max_top_p_classes())
@@ -6060,6 +6307,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                      dim_t batch_size,
                      dim_t depth,
                      dim_t sample_size) {
+      StreamGuard stream_guard;
       if (batch_size <= 0 || depth <= 0 || sample_size <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(batch_size * sample_size);
@@ -6083,6 +6331,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                       const void* input,
                       void* output,
                       dim_t size) {
+      StreamGuard stream_guard;
       if (size <= 0)
         return;
       const uint64_t total = static_cast<uint64_t>(size);
@@ -6111,6 +6360,7 @@ IM2COL_KERNEL(im2col_conv1d_bf16, ushort)
                    dim_t key_length,
                    dim_t cached_key_length,
                    dim_t alibi_offset) {
+      StreamGuard stream_guard;
       const uint64_t total = static_cast<uint64_t>(batch_size)
                              * static_cast<uint64_t>(num_heads)
                              * static_cast<uint64_t>(query_length)

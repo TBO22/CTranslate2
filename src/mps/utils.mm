@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
@@ -17,8 +18,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include <spdlog/spdlog.h>
+
 #include "mps/utils.h"
 #include "mps/kernels.h"
+#include "mps/testing.h"
 #include "ctranslate2/utils.h"
 
 namespace ctranslate2 {
@@ -28,8 +32,7 @@ namespace ctranslate2 {
     static id<MTLCommandQueue> g_queue = nil;
     static int g_device_index = 0;
     static std::mutex g_buffers_mutex;
-    static std::mutex g_error_mutex;
-    static std::string g_last_command_error;
+    static std::atomic<uint64_t> g_kept_error_warnings{0};
 
     struct BufferInfo {
       id<MTLBuffer> buffer;
@@ -145,11 +148,11 @@ namespace ctranslate2 {
       return static_cast<uint64_t>(parsed);
     }
 
+    // Preserve the fork's legacy dispatch-limit alias for existing callers.
     static uint64_t operation_limit(const char* specific_name, uint64_t default_value) {
       const char* legacy = std::getenv("CT2_MPS_MAX_OPS");
       const char* specific = std::getenv(specific_name);
-      const char* env = specific && specific[0] != '\0' ? specific : legacy;
-      return parse_operation_limit(env, default_value);
+      return parse_operation_limit(specific && specific[0] ? specific : legacy, default_value);
     }
 
     static uint64_t max_compute_operations() {
@@ -176,9 +179,6 @@ namespace ctranslate2 {
         // dangerous on unified-memory systems. Eight preserves useful overlap
         // while applying backpressure before memory pressure becomes extreme;
         // higher values corrupted cold Whisper encoders on an 8 GB M1.
-        // CT2_MPS_MAX_OPS is intentionally not consulted here: that legacy
-        // variable controls dispatch batching, not the number of resident
-        // Metal command buffers.
         const uint64_t configured = parse_operation_limit(
           std::getenv("CT2_MPS_MAX_INFLIGHT_COMMAND_BUFFERS"), 8);
         return static_cast<NSUInteger>(std::max<uint64_t>(1, configured));
@@ -241,8 +241,66 @@ namespace ctranslate2 {
                      static_cast<unsigned long long>(detail.second));
     }
 
-    static void record_command_buffer_error(id<MTLCommandBuffer> command_buffer) {
+    // The failure of the command buffers submitted by one stream. A completion
+    // handler runs on a Metal thread, possibly after the thread that owns the
+    // stream has exited, so the handlers hold a reference to this object and
+    // never to the stream. The error belongs to the stream that submitted the
+    // failed command buffer: only that stream's next synchronize() or
+    // command_buffer() throws it, and it is thrown once.
+    class CommandErrors {
+    public:
+      // Keeps the first error until it is taken.
+      void record(const std::string& message) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_message.empty())
+          _message = message.empty() ? "MPS command buffer failed" : message;
+      }
+
+      std::string take() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _logged = false;
+        std::string message;
+        message.swap(_message);
+        return message;
+      }
+
+      void throw_if_pending() {
+        std::string message = take();
+        if (!message.empty())
+          throw std::runtime_error(message);
+      }
+
+      bool pending() const {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return !_message.empty();
+      }
+
+      // Returns the pending error if no warning was logged for it yet, and
+      // remembers that one is about to be. Used by callers that keep the error
+      // for the stream but must tell somebody about it.
+      std::string claim_for_log() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_message.empty() || _logged)
+          return std::string();
+        _logged = true;
+        return _message;
+      }
+
+    private:
+      mutable std::mutex _mutex;
+      std::string _message;
+      bool _logged = false;
+    };
+
+    static void record_command_buffer_error(CommandErrors& errors,
+                                            std::atomic<bool>* reported,
+                                            id<MTLCommandBuffer> command_buffer) {
       if (!command_buffer || [command_buffer status] != MTLCommandBufferStatusError)
+        return;
+      // The completion handler and the stream that waits for the command
+      // buffer both get here. Only the first one records the failure, so it is
+      // not raised again after it was thrown.
+      if (reported && reported->exchange(true))
         return;
 
       std::string message = "MPS command buffer failed";
@@ -251,19 +309,13 @@ namespace ctranslate2 {
       if ([command_buffer error] && [[command_buffer error] localizedDescription])
         message += ": " + std::string([[[command_buffer error] localizedDescription] UTF8String]);
 
-      std::lock_guard<std::mutex> lock(g_error_mutex);
-      if (g_last_command_error.empty())
-        g_last_command_error = std::move(message);
+      errors.record(message);
     }
 
-    static void throw_last_command_error() {
-      std::string error;
-      {
-        std::lock_guard<std::mutex> lock(g_error_mutex);
-        error.swap(g_last_command_error);
-      }
-      if (!error.empty())
-        throw std::runtime_error(error);
+    static void log_kept_error(const std::string& message) {
+      ++g_kept_error_warnings;
+      spdlog::warn("{} (not raised here: the next operation on the stream that "
+                   "submitted it will raise it)", message);
     }
 
     static void ensure_initialized() {
@@ -279,9 +331,34 @@ namespace ctranslate2 {
       });
     }
 
+    class MPSStream;
+
+    static std::mutex& stream_registry_mutex() {
+      // Thread-local streams can be destroyed during process teardown. Keep
+      // the registry alive until the process exits, just like the in-flight
+      // resource registries above.
+      static std::mutex* mutex = new std::mutex;
+      return *mutex;
+    }
+
+    static std::unordered_set<MPSStream*>& stream_registry() {
+      static auto* streams = new std::unordered_set<MPSStream*>;
+      return *streams;
+    }
+
     class MPSStream {
     public:
+      MPSStream() {
+        std::lock_guard<std::mutex> lock(stream_registry_mutex());
+        stream_registry().insert(this);
+      }
+
       ~MPSStream() {
+        // Holding the registry lock keeps this object alive while a concurrent
+        // device-wide synchronization walks all thread-local streams. If that
+        // synchronization reached this stream first, the second wait below is
+        // a no-op.
+        std::lock_guard<std::mutex> lock(stream_registry_mutex());
         // A worker thread can finish with pending asynchronous work. Wait here
         // so completion handlers cannot outlive process-wide Metal state during
         // thread or process teardown. This is not on the inference hot path.
@@ -291,10 +368,19 @@ namespace ctranslate2 {
         }
         if (_last_submitted)
           [_last_submitted release];
+        stream_registry().erase(this);
+      }
+
+      void lock() {
+        _mutex.lock();
+      }
+
+      void unlock() {
+        _mutex.unlock();
       }
 
       id<MTLCommandBuffer> command_buffer() {
-        throw_last_command_error();
+        _errors->throw_if_pending();
         if (!_command_buffer) {
           ensure_initialized();
           if (!g_queue)
@@ -387,10 +473,12 @@ namespace ctranslate2 {
       }
 
       bool has_active_buffer(void* buffer) const {
+        std::lock_guard<std::recursive_mutex> lock(_mutex);
         return _active_buffers.find(buffer) != _active_buffers.end();
       }
 
       void flush() {
+        std::lock_guard<std::recursive_mutex> lock(_mutex);
         end_active_encoder();
         if (!_command_buffer)
           return;
@@ -402,9 +490,14 @@ namespace ctranslate2 {
         if (_last_submitted)
           [_last_submitted release];
         _last_submitted = submitted;
+        // The handler gets the error state of this stream, not the stream: the
+        // thread can exit before the command buffer completes.
+        auto errors = _errors;
+        auto reported = std::make_shared<std::atomic<bool>>(false);
+        _last_submitted_reported = reported;
         [submitted addCompletedHandler:^(id<MTLCommandBuffer> completed_buffer) {
           @autoreleasepool {
-            record_command_buffer_error(completed_buffer);
+            record_command_buffer_error(*errors, reported.get(), completed_buffer);
             if (profile_enabled()
                 && completed_buffer.GPUStartTime > 0
                 && completed_buffer.GPUEndTime >= completed_buffer.GPUStartTime) {
@@ -419,10 +512,15 @@ namespace ctranslate2 {
           ++g_profile.command_buffers_committed;
       }
 
-      void synchronize() {
+      // Commits and waits for everything this stream submitted, and records
+      // the failure of the last command buffer (its completion handler can
+      // run later). The recorded error is not thrown here.
+      void wait_for_submitted() {
+        std::lock_guard<std::recursive_mutex> lock(_mutex);
         end_active_encoder();
         id<MTLCommandBuffer> submitted = _command_buffer;
         std::shared_ptr<std::vector<void*>> resources;
+        std::shared_ptr<std::atomic<bool>> reported;
         if (submitted) {
           _command_buffer = nil;
           _compute_operations = 0;
@@ -432,30 +530,59 @@ namespace ctranslate2 {
             [_last_submitted release];
             _last_submitted = nil;
           }
+          _last_submitted_reported.reset();
           [submitted commit];
           if (profile_enabled())
             ++g_profile.command_buffers_committed;
         } else {
           submitted = _last_submitted;
           _last_submitted = nil;
+          reported = std::move(_last_submitted_reported);
         }
-        if (!submitted) {
-          throw_last_command_error();
+        if (!submitted)
           return;
-        }
         if (profile_enabled())
           ++g_profile.synchronizations;
         [submitted waitUntilCompleted];
         if (resources)
           unmark_inflight(resources);
-        record_command_buffer_error(submitted);
+        record_command_buffer_error(*_errors, reported.get(), submitted);
         [submitted release];
-        throw_last_command_error();
+      }
+
+      // Waits and throws the error of a failed command buffer of this stream,
+      // if there is one that was not thrown yet.
+      void synchronize() {
+        wait_for_submitted();
+        _errors->throw_if_pending();
+      }
+
+      // Waits like synchronize() but never throws. A failure is kept on the
+      // stream, so that its next real operation raises it. Returns the failure
+      // if it is new, for the caller to log once.
+      std::string wait_without_throwing() {
+        try {
+          wait_for_submitted();
+        } catch (const std::exception& error) {
+          _errors->record(error.what());
+        } catch (...) {
+          _errors->record("MPS synchronization failed");
+        }
+        return _errors->claim_for_log();
+      }
+
+      const std::shared_ptr<CommandErrors>& errors() const {
+        return _errors;
       }
 
     private:
+      // Encoding entry points reuse one another (for example batched GEMM can
+      // call GEMM), so nested StreamGuards on the owning thread are expected.
+      mutable std::recursive_mutex _mutex;
       id<MTLCommandBuffer> _command_buffer = nil;
       id<MTLCommandBuffer> _last_submitted = nil;
+      std::shared_ptr<std::atomic<bool>> _last_submitted_reported;
+      std::shared_ptr<CommandErrors> _errors = std::make_shared<CommandErrors>();
       id<MTLComputeCommandEncoder> _compute_encoder = nil;
       id<MTLBlitCommandEncoder> _blit_encoder = nil;
       uint64_t _compute_operations = 0;
@@ -466,6 +593,72 @@ namespace ctranslate2 {
     static MPSStream& current_stream() {
       static thread_local MPSStream stream;
       return stream;
+    }
+
+    StreamGuard::StreamGuard()
+      : _stream(&current_stream()) {
+      static_cast<MPSStream*>(_stream)->lock();
+    }
+
+    StreamGuard::~StreamGuard() {
+      static_cast<MPSStream*>(_stream)->unlock();
+    }
+
+    void synchronize_all() {
+      if (!has_mps())
+        return;
+
+      std::exception_ptr first_error;
+      std::string command_error;
+      {
+        // Device synchronization is an external execution barrier. Keeping
+        // the registry locked prevents a worker stream from being destroyed,
+        // or a new stream from beginning work, while the barrier is draining
+        // all streams that existed when it started.
+        std::lock_guard<std::mutex> lock(stream_registry_mutex());
+        for (MPSStream* stream : stream_registry()) {
+          try {
+            stream->wait_for_submitted();
+          } catch (...) {
+            if (!first_error)
+              first_error = std::current_exception();
+          }
+        }
+        // Report the error of one stream that has one. Taking it clears it, so
+        // it is not reported again here or by the stream that owns it; errors
+        // of other streams stay with their owners.
+        if (!first_error) {
+          for (MPSStream* stream : stream_registry()) {
+            command_error = stream->errors()->take();
+            if (!command_error.empty())
+              break;
+          }
+        }
+      }
+      if (first_error)
+        std::rethrow_exception(first_error);
+      if (!command_error.empty())
+        throw std::runtime_error(command_error);
+    }
+
+    void synchronize_all_nothrow() noexcept {
+      try {
+        if (!has_mps())
+          return;
+
+        std::vector<std::string> failures;
+        {
+          std::lock_guard<std::mutex> lock(stream_registry_mutex());
+          for (MPSStream* stream : stream_registry()) {
+            std::string failure = stream->wait_without_throwing();
+            if (!failure.empty())
+              failures.emplace_back(std::move(failure));
+          }
+        }
+        for (const std::string& failure : failures)
+          log_kept_error(failure);
+      } catch (...) {
+      }
     }
 
     bool has_mps() {
@@ -504,6 +697,17 @@ namespace ctranslate2 {
                      reason ? reason : "explicit",
                      bytes);
       current_stream().synchronize();
+    }
+
+    void synchronize_nothrow() noexcept {
+      try {
+        if (!has_mps())
+          return;
+        const std::string failure = current_stream().wait_without_throwing();
+        if (!failure.empty())
+          log_kept_error(failure);
+      } catch (...) {
+      }
     }
 
     void* allocate_buffer(size_t size) {
@@ -715,6 +919,28 @@ namespace ctranslate2 {
         return;
       std::lock_guard<std::mutex> lock(g_kernel_profile_mutex);
       ++g_profile_details[detail];
+    }
+
+    namespace testing {
+
+      void StreamErrorProbe::record(const std::string& message) const {
+        _errors->record(message);
+      }
+
+      bool StreamErrorProbe::pending() const {
+        return _errors->pending();
+      }
+
+      StreamErrorProbe stream_error_probe() {
+        StreamErrorProbe probe;
+        probe._errors = current_stream().errors();
+        return probe;
+      }
+
+      uint64_t kept_error_warnings() {
+        return g_kept_error_warnings.load();
+      }
+
     }
 
   }

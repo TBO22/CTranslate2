@@ -142,6 +142,7 @@ set(SOURCES
   src/layers/flash_attention.cc
   src/layers/common.cc
   src/layers/decoder.cc
+  src/layers/moe.cc
   src/layers/transformer.cc
   src/layers/wav2vec2.cc
   src/layers/wav2vec2bert.cc
@@ -170,6 +171,9 @@ set(SOURCES
   src/ops/dequantize.cc
   src/ops/dequantize_cpu.cc
   src/ops/flash_attention.cc
+  src/ops/fused_attention.cc
+  src/ops/moe_topk.cc
+  src/ops/moe_topk_cpu.cc
   src/ops/flash_attention_cpu.cc
   src/ops/gather.cc
   src/ops/gather_cpu.cc
@@ -245,6 +249,7 @@ set(CUDA_SOURCES
   src/ops/conv1d_gpu.cu
   src/ops/dequantize_gpu.cu
   src/ops/flash_attention_gpu.cu
+  src/ops/moe_topk_gpu.cu
   src/ops/gather_gpu.cu
   src/ops/gumbel_max_gpu.cu
   src/ops/layer_norm_gpu.cu
@@ -804,6 +809,12 @@ if(WITH_MPS)
     src/mps/ops_stubs.mm
     src/mps/primitives.mm
     src/mps/utils.mm
+    src/mps/ops_utils.mm
+    src/ops/flash_attention_mps.mm
+    src/layers/flash_attention_mps.cc
+    src/layers/moe_mps.mm
+    src/ops/fused_attention_mps.mm
+    src/ops/moe_topk_mps.mm
     src/ops/conv1d_mps.mm
     src/ops/layer_norm_mps.mm
     src/ops/mean_mps.mm

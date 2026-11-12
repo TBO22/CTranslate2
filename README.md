@@ -70,6 +70,13 @@ If you have an AMD ROCm GPU, we provide specific Python wheels on the [releases 
 
 ### Apple Silicon MPS backend (experimental)
 
+The decoder extension adds native tiled prefill and incremental attention,
+weight-only `int4_float16`, Qwen/Mixtral MoE, gated shared experts, and explicit
+sliding-window schedules. See [implementation, correctness, and measured
+llama.cpp comparisons](docs/mps_prefill_int4.md). The original translation
+benchmarks below describe the earlier backend revision; they do not establish
+LLM performance or an advantage over llama.cpp.
+
 MetalTranslate is implemented directly inside the CTranslate2 runtime. It is
 not a wrapper around PyTorch: model layers dispatch through CTranslate2's C++
 operator system into Objective-C++ and Metal kernels. The backend includes a
@@ -230,7 +237,7 @@ The backend keeps common decoding operations such as small TopK/argmax, TopP
 masking, multinomial/Gumbel sampling, ALiBi, median filtering, and quantized or
 dilated Conv1D on the GPU.
 
-Current MPS limitations include FlashAttention, AWQ INT4, INT16 GEMM,
+Current MPS limitations include AWQ INT4, INT16 GEMM,
 distributed collectives, and packed/shifted-u8 INT8 GEMM. GPU TopP currently
 supports up to 1024 classes, and the optimized small TopK path supports
 `k = 1, 2, 4, 8`. Metal kernels are compiled on first use, so performance

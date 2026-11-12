@@ -250,6 +250,59 @@ class ModelLoader(abc.ABC):
     def set_embeddings(self, spec, module):
         spec.weight = module.weight
 
+    def set_moe_feed_forward(self, spec, module, quant_type, projections):
+        if quant_type != common_spec.Quantization.CT2:
+            raise ValueError("Prequantized MoE expert formats are not supported")
+        router, experts = module.gate, module.experts
+        stacked = hasattr(experts, "gate_up_proj")
+        count = experts.gate_up_proj.shape[0] if stacked else len(experts)
+        topk = getattr(module, "top_k", getattr(router, "top_k", None))
+        normalize = getattr(
+            module, "norm_topk_prob", getattr(router, "norm_topk_prob", True)
+        )
+        sparse = transformer_spec.MoEFeedForwardSpec(count, topk, normalize)
+        sparse.layer_norm = spec.layer_norm
+        if getattr(router, "bias", None) is not None:
+            raise ValueError("Biased MoE routers are not supported")
+        sparse.router.weight = router.weight
+        if stacked:
+            gate_up, down = experts.gate_up_proj, experts.down_proj
+            if (
+                gate_up.ndim != 3
+                or down.ndim != 3
+                or gate_up.shape[0] != down.shape[0]
+                or gate_up.shape[1] != 2 * down.shape[2]
+                or gate_up.shape[2] != down.shape[1]
+            ):
+                raise ValueError("Invalid stacked SwiGLU expert shapes")
+            width = down.shape[2]
+            for e, target in enumerate(sparse.experts):
+                target.linear_0.weight = gate_up[e, :width]
+                target.linear_0_noact.weight = gate_up[e, width:]
+                target.linear_1.weight = down[e]
+        else:
+            for target, expert in zip(sparse.experts, experts):
+                for target_name, source_name in zip(
+                    ("linear_0", "linear_0_noact", "linear_1"), projections
+                ):
+                    self.set_linear(
+                        getattr(target, target_name), getattr(expert, source_name)
+                    )
+        if hasattr(module, "shared_expert"):
+            sparse.shared_expert = transformer_spec.FeedForwardSpec(glu=True)
+            del sparse.shared_expert.layer_norm
+            for target, source in zip(
+                ("linear_0", "linear_0_noact", "linear_1"),
+                ("gate_proj", "up_proj", "down_proj"),
+            ):
+                self.set_linear(
+                    getattr(sparse.shared_expert, target),
+                    getattr(module.shared_expert, source),
+                )
+            sparse.shared_expert_gate = common_spec.LinearSpec()
+            self.set_linear(sparse.shared_expert_gate, module.shared_expert_gate)
+        return sparse
+
     def set_position_encodings(self, spec, module):
         spec.encodings = module.weight
         offset = getattr(module, "offset", 0)
@@ -2431,7 +2484,9 @@ class MistralLoader(ModelLoader):
             quant_type=quant_type,
             quant_group_size=quant_group_size,
             quant_bits=quant_bits,
-            head_dim=model.config.head_dim,
+            head_dim=getattr(
+                model.config, "head_dim", model.config.hidden_size // num_heads
+            ),
         )
 
         self.set_decoder(spec.decoder, model.model, quant_type=quant_type)
@@ -2495,19 +2550,78 @@ class MistralLoader(ModelLoader):
                 quant_type=quant_type,
             )
 
-            self.set_linear(
-                layer_spec.ffn.linear_0, layer.mlp.gate_proj, quant_type=quant_type
-            )
-            self.set_linear(
-                layer_spec.ffn.linear_0_noact, layer.mlp.up_proj, quant_type=quant_type
-            )
-            self.set_linear(
-                layer_spec.ffn.linear_1, layer.mlp.down_proj, quant_type=quant_type
+            ffn_name = self.get_feed_forward_name(layer)
+            layer_spec.ffn = self.set_feed_forward(
+                layer_spec.ffn, getattr(layer, ffn_name), quant_type
             )
 
             delattr(layer, "self_attn")
-            delattr(layer, "mlp")
+            delattr(layer, ffn_name)
             gc.collect()
+
+    def get_feed_forward_name(self, layer):
+        return "mlp"
+
+    def set_feed_forward(self, spec, module, quant_type):
+        self.set_linear(spec.linear_0, module.gate_proj, quant_type=quant_type)
+        self.set_linear(spec.linear_0_noact, module.up_proj, quant_type=quant_type)
+        self.set_linear(spec.linear_1, module.down_proj, quant_type=quant_type)
+        return spec
+
+
+def _set_moe_attention_windows(spec, config):
+    """Mask absolute positions; retain prefixes until a cache base is tracked."""
+    window = getattr(config, "sliding_window", None) or 0
+    kinds = getattr(config, "layer_types", None)
+    if (
+        kinds is None
+        and window
+        and getattr(config, "use_sliding_window", False)
+        and getattr(config, "model_type", "") == "qwen2_moe"
+        and getattr(config, "max_window_layers", 0) > 0
+    ):
+        raise ValueError(
+            "Qwen2 MoE windows require explicit layer_types: "
+            "older eager and FlashAttention schedules differ"
+        )
+    if kinds is None:
+        enabled = getattr(config, "use_sliding_window", bool(window))
+        kinds = ["sliding_attention" if enabled and window else "full_attention"] * len(
+            spec.decoder.layer
+        )
+    if len(kinds) != len(spec.decoder.layer) or any(
+        kind not in ("full_attention", "sliding_attention") for kind in kinds
+    ):
+        raise ValueError("Unsupported MoE attention layer schedule")
+    if hasattr(spec.decoder, "sliding_window"):
+        spec.decoder.sliding_window = np.int32(0)
+    for layer, kind in zip(spec.decoder.layer, kinds):
+        if kind == "sliding_attention" and window <= 0:
+            raise ValueError("Sliding attention requires a positive window")
+        layer.self_attention.sliding_window = np.int32(
+            window if kind == "sliding_attention" else 0
+        )
+        layer.self_attention.absolute_window = np.int8(True)
+
+
+@register_loader("MixtralConfig")
+class MixtralLoader(MistralLoader):
+    @property
+    def architecture_name(self):
+        return "MixtralForCausalLM"
+
+    def get_model_spec(self, model):
+        if model.config.hidden_act not in ("silu", "swish"):
+            raise ValueError("Mixtral MoE requires SwiGLU activation")
+        spec = super().get_model_spec(model)
+        _set_moe_attention_windows(spec, model.config)
+        return spec
+
+    def get_feed_forward_name(self, layer):
+        return "block_sparse_moe" if hasattr(layer, "block_sparse_moe") else "mlp"
+
+    def set_feed_forward(self, spec, module, quant_type):
+        return self.set_moe_feed_forward(spec, module, quant_type, ("w1", "w3", "w2"))
 
 
 @register_loader("Qwen2Config")
@@ -2636,19 +2750,40 @@ class Qwen2Loader(ModelLoader):
                 quant_type=quant_type,
             )
 
-            self.set_linear(
-                layer_spec.ffn.linear_0, layer.mlp.gate_proj, quant_type=quant_type
-            )
-            self.set_linear(
-                layer_spec.ffn.linear_0_noact, layer.mlp.up_proj, quant_type=quant_type
-            )
-            self.set_linear(
-                layer_spec.ffn.linear_1, layer.mlp.down_proj, quant_type=quant_type
+            layer_spec.ffn = self.set_feed_forward(
+                layer_spec.ffn, layer.mlp, quant_type
             )
 
             delattr(layer, "self_attn")
             delattr(layer, "mlp")
             gc.collect()
+
+    def set_feed_forward(self, spec, module, quant_type):
+        self.set_linear(spec.linear_0, module.gate_proj, quant_type=quant_type)
+        self.set_linear(spec.linear_0_noact, module.up_proj, quant_type=quant_type)
+        self.set_linear(spec.linear_1, module.down_proj, quant_type=quant_type)
+        return spec
+
+
+@register_loader("Qwen2MoeConfig")
+class Qwen2MoeLoader(Qwen2Loader):
+    @property
+    def architecture_name(self):
+        return "Qwen2MoeForCausalLM"
+
+    def get_model_spec(self, model):
+        if model.config.hidden_act not in ("silu", "swish"):
+            raise ValueError("Qwen2 MoE requires SwiGLU activation")
+        spec = super().get_model_spec(model)
+        _set_moe_attention_windows(spec, model.config)
+        return spec
+
+    def set_feed_forward(self, spec, module, quant_type):
+        if not hasattr(module, "experts"):
+            return super().set_feed_forward(spec, module, quant_type)
+        return self.set_moe_feed_forward(
+            spec, module, quant_type, ("gate_proj", "up_proj", "down_proj")
+        )
 
 
 @register_loader("Qwen3Config")
@@ -2787,19 +2922,40 @@ class Qwen3Loader(ModelLoader):
                 quant_type=quant_type,
             )
 
-            self.set_linear(
-                layer_spec.ffn.linear_0, layer.mlp.gate_proj, quant_type=quant_type
-            )
-            self.set_linear(
-                layer_spec.ffn.linear_0_noact, layer.mlp.up_proj, quant_type=quant_type
-            )
-            self.set_linear(
-                layer_spec.ffn.linear_1, layer.mlp.down_proj, quant_type=quant_type
+            layer_spec.ffn = self.set_feed_forward(
+                layer_spec.ffn, layer.mlp, quant_type
             )
 
             delattr(layer, "self_attn")
             delattr(layer, "mlp")
             gc.collect()
+
+    def set_feed_forward(self, spec, module, quant_type):
+        self.set_linear(spec.linear_0, module.gate_proj, quant_type=quant_type)
+        self.set_linear(spec.linear_0_noact, module.up_proj, quant_type=quant_type)
+        self.set_linear(spec.linear_1, module.down_proj, quant_type=quant_type)
+        return spec
+
+
+@register_loader("Qwen3MoeConfig")
+class Qwen3MoeLoader(Qwen3Loader):
+    def get_model_spec(self, model):
+        if model.config.hidden_act not in ("silu", "swish"):
+            raise ValueError("Qwen3 MoE requires SwiGLU activation")
+        spec = super().get_model_spec(model)
+        _set_moe_attention_windows(spec, model.config)
+        return spec
+
+    @property
+    def architecture_name(self):
+        return "Qwen3MoeForCausalLM"
+
+    def set_feed_forward(self, spec, module, quant_type):
+        if not hasattr(module, "experts"):
+            return super().set_feed_forward(spec, module, quant_type)
+        return self.set_moe_feed_forward(
+            spec, module, quant_type, ("gate_proj", "up_proj", "down_proj")
+        )
 
 
 @register_loader("MixFormerSequentialConfig")

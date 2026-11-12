@@ -1,18 +1,27 @@
 #include "ctranslate2/layers/attention.h"
+#include "layers/attention_utils.h"
 #include "ctranslate2/ops/split.h"
+#include "ctranslate2/ops/fused_attention.h"
+#include "ctranslate2/ops/rms_norm.h"
 #include "ctranslate2/utils.h"
 
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <numeric>
+#include <cstdint>
+#include <stdexcept>
+#include <limits>
 
 #include "dispatch.h"
 #include "cpu/parallel.h"
 
 #ifdef CT2_WITH_MPS
 #  include "mps/kernels.h"
+#endif
+
+#ifdef CT2_WITH_CUDA
+#  include "cuda/utils.h"
 #endif
 
 namespace ctranslate2 {
@@ -171,104 +180,64 @@ namespace ctranslate2 {
 
     static const ops::Transpose transpose_op({0, 2, 1, 3});
 
-#ifdef CT2_WITH_MPS
-    static bool mps_fused_attention_enabled() {
-      static const bool enabled = []() {
-        const char* value = std::getenv("CT2_MPS_USE_FUSED_ATTENTION");
-        return value && value[0] != '\0' && value[0] != '0';
-      }();
-      return enabled;
-    }
-#endif
-
     static inline void save_attention(StorageView& attention, StorageView weights, dim_t beam_size) {
       if (beam_size == 1)
         attention = std::move(weights);
       else {
+        if (attention.dtype() != weights.dtype())
+          attention = StorageView(weights.dtype(), weights.device());
         transpose_op(weights, attention);
         attention.reshape({-1, weights.dim(1), 1, weights.dim(-1)});
       }
     }
 
-    static void dot_product_attention(const StorageView& queries,
-                                      const StorageView& keys,
-                                      const StorageView& values,
-                                      const StorageView* values_lengths,
-                                      const StorageView* relative_position_keys,
-                                      const StorageView* relative_asymmetric_position_keys,
-                                      const StorageView* relative_position_values,
-                                      const StorageView* relative_attention_bias,
-                                      dim_t relative_left_max_position,
-                                      dim_t relative_right_max_position,
-                                      dim_t maximum_relative_position,
-                                      StorageView& output,
-                                      StorageView* attention = nullptr,
-                                      bool return_normalized_attention = true,
-                                      float queries_scale = 1,
-                                      bool is_decoder = false,
-                                      bool with_cache = false,
-                                      dim_t beam_size = 1,
-                                      Alibi* alibi = nullptr,
-                                      StorageView* position_bias = nullptr,
-                                      bool interleaved_queries = false) {
+    static const StorageView& as_dtype(const StorageView& input,
+                                       DataType dtype,
+                                       StorageView& converted) {
+      if (input.dtype() == dtype)
+        return input;
+      converted = input.to(dtype);
+      return converted;
+    }
+
+    void dot_product_attention(const StorageView& queries,
+                               const StorageView& keys,
+                               const StorageView& values,
+                               const StorageView* values_lengths,
+                               const StorageView* relative_position_keys,
+                               const StorageView* relative_asymmetric_position_keys,
+                               const StorageView* relative_position_values,
+                               const StorageView* relative_attention_bias,
+                               dim_t relative_left_max_position,
+                               dim_t relative_right_max_position,
+                               dim_t maximum_relative_position,
+                               StorageView& output,
+                               StorageView* attention,
+                               bool return_normalized_attention,
+                               float queries_scale,
+                               bool is_decoder,
+                               bool with_cache,
+                               dim_t beam_size,
+                               Alibi* alibi,
+                               StorageView* position_bias,
+                               bool interleaved_queries, dim_t window, dim_t offset) {
       PROFILE("dot_product_attention");
 
-#ifdef CT2_WITH_MPS
-      // During beam decoding, split_heads represents beams as the query
-      // dimension. Fuse QK, softmax, and PV for this exact contiguous layout.
-      // Keep the path opt-in while it is benchmarked against the established
-      // implementation; CT2_MPS_USE_FUSED_ATTENTION=1 enables it.
-      const bool standard_layout = !interleaved_queries
-                                   && queries.rank() == 4
-                                   && keys.rank() == 4
-                                   && values.rank() == 4
-                                   && queries.dim(0) == keys.dim(0)
-                                   && queries.dim(0) == values.dim(0)
-                                   && queries.dim(1) == keys.dim(1)
-                                   && queries.dim(1) == values.dim(1)
-                                   && keys.dim(2) == values.dim(2)
-                                   && queries.dim(3) == keys.dim(3)
-                                   && queries.dim(3) == values.dim(3);
-      const bool interleaved_layout = interleaved_queries
-                                      && queries.rank() == 4
-                                      && keys.rank() == 4
-                                      && values.rank() == 4
-                                      && queries.dim(0) == keys.dim(0)
-                                      && queries.dim(0) == values.dim(0)
-                                      && queries.dim(2) == keys.dim(1)
-                                      && queries.dim(2) == values.dim(1)
-                                      && keys.dim(2) == values.dim(2)
-                                      && queries.dim(3) == keys.dim(3)
-                                      && queries.dim(3) == values.dim(3);
-      if (mps_fused_attention_enabled()
-          && queries.device() == Device::MPS
-          && queries.dtype() == DataType::FLOAT16
-          && (standard_layout || interleaved_layout)
+      if (!window
           && !relative_position_keys
           && !relative_asymmetric_position_keys
           && !relative_position_values
           && !relative_attention_bias
           && !alibi
-          && !attention) {
-        output.resize_as(queries);
-        const dim_t num_heads = interleaved_layout ? queries.dim(2) : queries.dim(1);
-        const dim_t query_length = interleaved_layout ? queries.dim(1) : queries.dim(2);
-        const dim_t matrix_batch = queries.dim(0) * num_heads;
-        if (mps::fused_attention(DataType::FLOAT16,
-                                 queries.data<float16_t>(),
-                                 keys.data<float16_t>(),
-                                 values.data<float16_t>(),
-                                 values_lengths ? values_lengths->data<int32_t>() : nullptr,
-                                 output.data<float16_t>(),
-                                 matrix_batch,
-                                 query_length,
-                                 keys.dim(2),
-                                 queries.dim(3),
-                                 queries_scale,
-                                 interleaved_layout ? num_heads : 0))
-          return;
-      }
-#endif
+          && !attention
+          && ops::FusedAttention()(queries,
+                                   keys,
+                                   values,
+                                   values_lengths,
+                                   queries_scale,
+                                   interleaved_queries,
+                                   output))
+        return;
 
       // The interleaved layout is only selected for the fused MPS path. Keep a
       // correct generic fallback if a future model shape falls outside the
@@ -297,7 +266,7 @@ namespace ctranslate2 {
                               beam_size,
                               alibi,
                               position_bias,
-                              false);
+                              false, window, offset);
         transpose_op(standard_output, output);
         return;
       }
@@ -318,23 +287,38 @@ namespace ctranslate2 {
                                        maximum_relative_position).to(queries.device()));
       }
 
-      const ops::MatMul keys_matmul(/*trans_a=*/false, /*trans_b=*/true, queries_scale);
-      keys_matmul(queries, keys, output);
-      if (relative_position_keys)
-        add_relative_representations(queries,
-                                     *relative_positions,
-                                     *relative_position_keys,
-                                     keys_matmul,
-                                     output);
+      // Keep alignment scores in FP32 until after softmax: low-precision rounding can
+      // turn large, distinct scores into equal probabilities.
+      const bool fp32_scores = attention && queries.device() == Device::CUDA
+        && (queries.dtype() == DataType::FLOAT16 || queries.dtype() == DataType::BFLOAT16);
+      StorageView float_scores(DataType::FLOAT32, queries.device());
+      StorageView& scores = fp32_scores ? float_scores : output;
+      {
+#ifdef CT2_WITH_CUDA
+        // Accumulate attention scores in FP32: the unscaled dot product can
+        // overflow FP16 even when the scaled score is representable.
+        const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+        const ops::MatMul keys_matmul(/*trans_a=*/false, /*trans_b=*/true, queries_scale);
+        StorageView converted_queries, converted_keys, converted_rel_keys, converted_asym_keys;
+        const StorageView& score_queries = as_dtype(queries, scores.dtype(), converted_queries);
+        keys_matmul(score_queries, as_dtype(keys, scores.dtype(), converted_keys), scores);
+        if (relative_position_keys)
+          add_relative_representations(score_queries,
+                                       *relative_positions,
+                                       as_dtype(*relative_position_keys, scores.dtype(), converted_rel_keys),
+                                       keys_matmul,
+                                       scores);
 
-      if (relative_asymmetric_position_keys)
-        add_relative_representations(queries,
-                                     *relative_positions,
-                                     *relative_asymmetric_position_keys,
-                                     keys_matmul,
-                                     output);
+        if (relative_asymmetric_position_keys)
+          add_relative_representations(score_queries,
+                                       *relative_positions,
+                                       as_dtype(*relative_asymmetric_position_keys, scores.dtype(), converted_asym_keys),
+                                       keys_matmul,
+                                       scores);
+      }
       if (relative_attention_bias) {
-        StorageView local_position_bias(output.dtype(), output.device());
+        StorageView local_position_bias(scores.dtype(), scores.device());
 
         if (!position_bias)
           position_bias = &local_position_bias;
@@ -359,24 +343,60 @@ namespace ctranslate2 {
           position_bias_per_gpu = &position_bias_tmp;
         }
 
-        DEVICE_AND_TYPE_DISPATCH(output.device(), output.dtype(),
-                                 primitives<D>::add_batch_broadcast(position_bias_per_gpu->data<T>(),
-                                                                    output.data<T>(),
-                                                                    position_bias_per_gpu->size(),
-                                                                    output.size()));
+        StorageView converted_bias;
+        const StorageView& score_bias = as_dtype(*position_bias_per_gpu, scores.dtype(), converted_bias);
+        DEVICE_AND_TYPE_DISPATCH(scores.device(), scores.dtype(),
+                                 primitives<D>::add_batch_broadcast(score_bias.data<T>(),
+                                                                    scores.data<T>(),
+                                                                    score_bias.size(),
+                                                                    scores.size()));
       }
 
       if (alibi)
-        alibi->apply(output, queries_scale);
+        alibi->apply(scores, queries_scale);
 
-      StorageView attn(values.dtype(), values.device());
+      // Absolute window masks also cover prefills longer than the window.
+      StorageView window_bounds(DataType::INT32, scores.device());
+      if (window) {
+        const dim_t qlen = queries.dim(2), klen = keys.dim(2);
+        const dim_t rows = scores.size() / klen;
+        window_bounds.resize({rows});
+#ifdef CT2_WITH_MPS
+        if (scores.device() == Device::MPS) {
+          mps::mask_flash_scores(scores.dtype(), scores.buffer(),
+              values_lengths ? values_lengths->data<int32_t>() : nullptr,
+              window_bounds.data<int32_t>(), rows, queries.dim(1), qlen,
+              klen, offset, window, true, false);
+        } else
+#endif
+        if (scores.device() == Device::CPU && scores.dtype() == DataType::FLOAT32) {
+          for (dim_t row = 0; row < rows; ++row) {
+            const dim_t position = offset + row % qlen;
+            const dim_t first = std::max<dim_t>(0, position + 1 - window);
+            dim_t end = std::min<dim_t>(klen, position + 1);
+            if (values_lengths) end = std::min<dim_t>(end, values_lengths->data<int32_t>()[row]);
+            window_bounds.data<int32_t>()[row] = end > first ? end : 0;
+            std::fill_n(scores.data<float>() + row*klen, std::min(first,klen),
+                        -std::numeric_limits<float>::infinity());
+          }
+        } else
+          throw std::invalid_argument("Absolute window attention supports CPU float32 and MPS fp16/bf16");
+        values_lengths = &window_bounds;
+      }
+
+      StorageView attn(scores.dtype(), scores.device());
       if (attention && !return_normalized_attention) {
-        ops::SoftMax()(output, values_lengths, attn);
-        save_attention(*attention, std::move(output), beam_size);
+        ops::SoftMax()(scores, values_lengths, attn);
+        if (fp32_scores)
+          scores = scores.to(values.dtype());
+        save_attention(*attention, std::move(scores), beam_size);
       } else {
-        attn = std::move(output);
+        attn = std::move(scores);
         ops::SoftMax()(attn, values_lengths, attn);
       }
+
+      if (fp32_scores)
+        attn = attn.to(values.dtype());
 
       const ops::MatMul values_matmul;
       values_matmul(attn, values, output);
@@ -412,6 +432,7 @@ namespace ctranslate2 {
       , _relative_asymmetric_position_keys(model.get_variable_if_exists(scope + "/relative_asymmetric_position_keys"))
       , _relative_position_values(model.get_variable_if_exists(scope + "/relative_position_values"))
       , _merge_time_and_head_dims(_multi_query
+                                  && !_absolute_window
                                   && !_relative_attention_bias
                                   && !_relative_position_keys
                                   && !_relative_position_values)
@@ -593,11 +614,8 @@ namespace ctranslate2 {
 
       if (!_self_attention) {
 
-        bool use_interleaved_beam_layout = false;
-#ifdef CT2_WITH_MPS
-        use_interleaved_beam_layout = mps_fused_attention_enabled()
-                                      && device == Device::MPS
-                                      && dtype == DataType::FLOAT16
+        const bool use_interleaved_beam_layout =
+          ops::FusedAttention().supports_interleaved_queries(device, dtype)
                                       && !attention
                                       && !queries_padder
                                       && !_relative_position_keys
@@ -605,7 +623,6 @@ namespace ctranslate2 {
                                       && !_relative_position_values
                                       && !_relative_attention_bias
                                       && !_alibi;
-#endif
 
         process_cross_attention(queries, values, fused_proj, queries_proj, keys_proj,
                                 values_proj, cached_keys, cached_values,
@@ -681,7 +698,7 @@ namespace ctranslate2 {
             tmp = std::move(*cached_values);
             concat_op({&tmp, &values_proj}, *cached_values);
 
-            if (!prefilling && _sliding_window > 0 && cached_keys->shape()[2] > _sliding_window) {
+            if (!_absolute_window && !prefilling && _sliding_window > 0 && cached_keys->shape()[2] > _sliding_window) {
               // only for generation
               const ops::Slide slide_op(2, 1, cached_keys->shape()[2] - 1);
               slide_op(*cached_keys, tmp);
@@ -719,9 +736,11 @@ namespace ctranslate2 {
                             beam_size,
                             _alibi,
                             position_bias,
-                            interleaved_beam_layout);
+                            interleaved_beam_layout,
+                            _absolute_window && _self_attention ? _sliding_window : 0,
+                            offset);
 
-      if (prefilling && cached_keys && cached_keys->shape()[2] > _sliding_window) {
+      if (!_absolute_window && prefilling && cached_keys && cached_keys->shape()[2] > _sliding_window) {
         // set only last sliding_window tokens to cached_keys and cached_values after computing attention
         const ops::Slide slide_op(2, cached_keys->shape()[2] - _sliding_window, _sliding_window);
         StorageView tmp(dtype, device);
@@ -990,5 +1009,6 @@ namespace ctranslate2 {
       if (padder)
         padder->remove_padding(x);
     }
+
   }
 }

@@ -80,6 +80,9 @@ namespace ctranslate2 {
         return const_cast<Decoder&>(*this).output_layer().output_type();
       }
 
+      // Logits can retain greater precision than decoder activations/caches.
+      virtual DataType logits_type() const { return output_type(); }
+
       dim_t output_size() const override {
         return const_cast<Decoder&>(*this).output_layer().output_size();
       }

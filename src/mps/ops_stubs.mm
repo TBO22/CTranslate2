@@ -244,7 +244,6 @@ template <Device D, typename T>
 void Mean::compute(const StorageView&, dim_t, dim_t, dim_t, bool, StorageView&) const { THROW_MPS(Mean) }
 
 // --- Flash Attention & AWQ ---
-template<> void FlashAttention::compute<Device::MPS>(StorageView&, StorageView&, StorageView&, StorageView&, StorageView*, StorageView*, StorageView*, bool, StorageView*, StorageView*, bool, StorageView*, dim_t) const { THROW_MPS(FlashAttention) }
 
 template<> void DequantizeAwq::dequantize<Device::MPS, int32_t, float16_t>(const StorageView&, const StorageView&, const StorageView&, StorageView&) const { THROW_MPS(DequantizeAwq) }
 
