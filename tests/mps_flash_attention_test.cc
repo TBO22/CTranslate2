@@ -156,7 +156,8 @@ TEST(MPSBackendTest, FlashPrefillLongMqaAndLargeScoresAreStable) {
 
 TEST(MPSBackendTest, FlashDecodeMatchesDoubleReferenceAcrossSplitsGqaAndMasks) {
   for (auto dtype : {DataType::FLOAT16, DataType::BFLOAT16})
-    for (dim_t depth : {dim_t(13), dim_t(64), dim_t(128), dim_t(256)})
+    for (dim_t depth : {dim_t(13), dim_t(64), dim_t(65), dim_t(128), dim_t(129),
+                        dim_t(255), dim_t(256)})
       for (dim_t valid : {dim_t(65), dim_t(257), dim_t(2049)}) {
         SCOPED_TRACE(::testing::Message()
                      << int(dtype) << ' ' << depth << ' ' << valid);
@@ -215,6 +216,41 @@ TEST(MPSBackendTest, FlashDecodeStableLargeScoresMqaAndPoisonedUnusedCache) {
     expect_storage_eq(out.to_float32(),
                       reference_attention(q, k, v, valid, valid - 1, 0), .016f);
   }
+}
+
+TEST(MPSBackendTest, FlashDecodeCooperativeChunksRespectMasksAndTokenOrder) {
+  constexpr dim_t batch = 2, queries = 3, heads = 6, kvheads = 2;
+  constexpr dim_t valid = 257, capacity = 512, offset = valid - queries;
+  for (auto dtype : {DataType::FLOAT16, DataType::BFLOAT16})
+    for (dim_t depth : {65, 128}) {
+      const auto q = signal({batch, queries, heads, depth}, dtype, .13f);
+      const auto k = signal({batch, capacity, kvheads, depth}, dtype, .07f);
+      const auto v = signal(k.shape(), dtype, .11f);
+      auto qgpu = q.to(Device::MPS), kgpu = k.to(Device::MPS),
+           vgpu = v.to(Device::MPS);
+      std::vector<int32_t> lengths(batch * heads * queries, valid);
+      lengths[0] = 0;
+      lengths[3] = valid / 2;
+      StorageView bounds({batch, heads, queries}, lengths, Device::MPS),
+          out(q.shape(), dtype, Device::MPS),
+          workspace({batch, heads, queries, 2, depth + 2}, DataType::FLOAT32,
+                    Device::MPS);
+      for (bool causal : {false, true})
+        for (dim_t window : {0, 17}) {
+          if (!causal && window)
+            continue;
+          ASSERT_TRUE(mps::flash_decode(
+              dtype, qgpu.buffer(), kgpu.buffer(), vgpu.buffer(),
+              bounds.data<int32_t>(), out.buffer(), workspace.data<float>(),
+              workspace.size(), batch, heads, kvheads, valid, capacity, depth,
+              1.f / std::sqrt(float(depth)), offset, window, causal, queries,
+              true, true));
+          expect_storage_eq(out.to_float32(),
+                            reference_attention(q, k, v, valid, offset, window,
+                                                &lengths, causal),
+                            dtype == DataType::FLOAT16 ? .002f : .016f);
+        }
+    }
 }
 
 TEST(MPSBackendTest,

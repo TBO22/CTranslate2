@@ -158,3 +158,7 @@ logit error 0.119/0.131 after excluding padded/suppressed entries.
 Token timings above omit logit capture and retain identical hypotheses. CPU
 vocabulary padding differs (64171 vs MPS 64176), so references must exclude the
 padded tail and suppressed-token sentinels.
+
+The subsequent [M1 throughput work](mps_throughput_optimization.md) adds a
+separate cooperative QK entry point for compact-cache decode. The standard-layout
+Whisper/Marian kernel remains the established implementation.

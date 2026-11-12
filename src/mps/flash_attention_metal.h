@@ -34,14 +34,12 @@ struct FlashDecodeArgs {
 // One query/head, split into 256-key blocks. Each thread computes two scores;
 // all threads then cooperate on the value product. Partial FP32 numerators,
 // maxima and denominators permit a stable merge without storing attention.
-kernel void flash_decode_partial(
-    device const ushort* q [[buffer(0)]], device const ushort* k [[buffer(1)]],
-    device const ushort* v [[buffer(2)]], device const int* lengths [[buffer(3)]],
-    device float* partials [[buffer(4)]], device ushort* output [[buffer(5)]],
-    constant FlashDecodeArgs& a [[buffer(6)]], uint2 group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-    uint simd [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float probabilities[256], maxima[4], sums[4];
+template<bool COOPERATIVE>
+inline void flash_decode_partial_impl(
+    device const ushort* q, device const ushort* k, device const ushort* v,
+    device const int* lengths, device float* partials, device ushort* output,
+    constant FlashDecodeArgs& a, uint2 group, uint tid, uint lane, uint simd,
+    threadgroup float* probabilities, threadgroup float* maxima, threadgroup float* sums) {
   const uint query = group.y % a.queries;
   const uint head = (group.y / a.queries) % a.heads, batch = group.y / a.queries / a.heads;
   const uint kv_head = head / (a.heads / a.kv_heads), start = group.x * 256;
@@ -56,6 +54,35 @@ kernel void flash_decode_partial(
     ? ulong(batch)*a.capacity*a.kv_heads+kv_head : (ulong(batch)*a.kv_heads+kv_head)*a.capacity) * a.depth;
   const ulong stride = ulong(a.kv_interleaved ? a.kv_heads : 1) * a.depth;
   float scores[2];
+  if (COOPERATIVE) {
+    // One SIMD group cooperates on each dot product. Adjacent lanes read
+    // adjacent head dimensions instead of striding across entire KV rows.
+    // Query fragments remain in registers across the 64 keys per SIMD group.
+    float query_values[8];
+    for (uint i = 0; i < 8; ++i) {
+      const uint d = lane+i*32;
+      query_values[i] = d < a.depth ? attention_value(q[qbase+d], a.bf16) : 0;
+    }
+    for (uint i = 0; i < 64; ++i) {
+      const uint token = start+simd+i*4;
+      float score = 0;
+      if (token >= first && token < valid) {
+        for (uint j = 0; j < 8; ++j) {
+          const uint d = lane+j*32;
+          if (d < a.depth)
+            score = fma(query_values[j], attention_value(k[kvbase+ulong(token)*stride+d], a.bf16), score);
+        }
+      }
+      score = simd_sum(score);
+      if (lane == 0) probabilities[simd+i*4] = token >= first && token < valid ? score*a.scale : -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    scores[0] = probabilities[tid];
+    scores[1] = probabilities[tid+128];
+    // All groups must finish reading the score tile before it is reused for
+    // probabilities below; this barrier is required even on unified memory.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else {
   for (uint i = 0; i < 2; ++i) {
     const uint token = start + tid + i * 128;
     float score = 0;
@@ -65,6 +92,7 @@ kernel void flash_decode_partial(
                     attention_value(k[kvbase+ulong(token)*stride+d], a.bf16), score);
       scores[i] = score * a.scale;
     } else scores[i] = -INFINITY;
+  }
   }
   const float local_max = simd_max(max(scores[0], scores[1]));
   if (lane == 0) maxima[simd] = local_max;
@@ -96,6 +124,30 @@ kernel void flash_decode_partial(
     partials[partial_base+a.depth] = maximum;
     partials[partial_base+a.depth+1] = denominator;
   }
+}
+
+kernel void flash_decode_partial(
+    device const ushort* q [[buffer(0)]], device const ushort* k [[buffer(1)]],
+    device const ushort* v [[buffer(2)]], device const int* lengths [[buffer(3)]],
+    device float* partials [[buffer(4)]], device ushort* output [[buffer(5)]],
+    constant FlashDecodeArgs& a [[buffer(6)]], uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float probabilities[256], maxima[4], sums[4];
+  flash_decode_partial_impl<false>(q, k, v, lengths, partials, output, a,
+                                      group, tid, lane, simd, probabilities, maxima, sums);
+}
+
+kernel void flash_decode_partial_cooperative(
+    device const ushort* q [[buffer(0)]], device const ushort* k [[buffer(1)]],
+    device const ushort* v [[buffer(2)]], device const int* lengths [[buffer(3)]],
+    device float* partials [[buffer(4)]], device ushort* output [[buffer(5)]],
+    constant FlashDecodeArgs& a [[buffer(6)]], uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float probabilities[256], maxima[4], sums[4];
+  flash_decode_partial_impl<true>(q, k, v, lengths, partials, output, a,
+                                      group, tid, lane, simd, probabilities, maxima, sums);
 }
 
 kernel void flash_decode_merge(device const float* partials [[buffer(0)]],

@@ -9,7 +9,8 @@ namespace ctranslate2 {
                 const StorageView& weights,
                 const std::vector<std::array<const StorageView*, 3>>& experts,
                 StorageView& output, bool force_gemv, bool force_small_tiles,
-                const std::vector<std::array<const StorageView*, 3>>* scales) {
+                const std::vector<std::array<const StorageView*, 3>>* scales,
+                bool force_generic_plan) {
       const dim_t rows = input.dim(0), hidden = input.dim(1), topk = ids.dim(1);
       if (experts.empty())
         throw std::invalid_argument("MPS MoE requires at least one expert");
@@ -35,7 +36,7 @@ namespace ctranslate2 {
       moe_dispatch_plan(ids.data<int32_t>(), offsets.data<int32_t>(),
                         permutation.data<int32_t>(), inverse.data<int32_t>(),
                         indirect.data<int32_t>(), rows, count, topk, hidden,
-                        intermediate, decode, wide);
+                        intermediate, decode, wide, force_generic_plan);
       for (dim_t e = 0; e < count; ++e) {
         moe_expert_project(
             dtype, input.buffer(), experts[e][0]->buffer(),

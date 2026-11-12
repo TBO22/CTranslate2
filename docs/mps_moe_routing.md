@@ -276,3 +276,7 @@ Returned Marian single-item raw-logit snapshots now agree with CPU argmax at all
 four checked steps; suppressed/padded entries are excluded from numerical error
 comparisons. Files: `whisper-moe-regression.*`, `marian-moe-regression.*`.
 These smoke tests do not replace corpus WER/BLEU qualification.
+
+See [M1 throughput work](mps_throughput_optimization.md) for vectorized FP16/INT4
+expert decode, fused small GPU routing plans, measurements, and remaining
+per-expert dispatch overhead.

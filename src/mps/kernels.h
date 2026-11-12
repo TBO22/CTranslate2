@@ -408,7 +408,7 @@ namespace ctranslate2 {
     void moe_dispatch_plan(const int32_t* ids, int32_t* offsets, int32_t* permutation,
                            int32_t* inverse, int32_t* indirect, dim_t rows, dim_t experts,
                            dim_t topk, dim_t hidden, dim_t intermediate, bool decode,
-                           bool wide = false);
+                           bool wide = false, bool force_generic = false);
     void moe_expert_project(DataType dtype, const void* input, const void* gate,
                             const void* up, void* output, const int32_t* offsets,
                             const int32_t* permutation, const int32_t* indirect,

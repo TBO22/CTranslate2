@@ -36,6 +36,9 @@ def test_real_decoder_repeated_prefill_logits_are_finite(
         "CT2_MPS_DISABLE_FLASH_DECODE",
         "CT2_MPS_DISABLE_FLASH_PREFILL",
         "CT2_MPS_USE_FLASH_CROSS_ATTENTION",
+        "CT2_MPS_DISABLE_COOPERATIVE_QK",
+        "CT2_MPS_DISABLE_VECTOR_MOE",
+        "CT2_MPS_DISABLE_SMALL_MOE_PLAN",
     ):
         environment.pop(name, None)
     result = subprocess.run(
@@ -107,6 +110,9 @@ print(json.dumps([result.sequences_ids[0] for result in results]))
         if name.startswith("CT2_MPS_USE_") or name in (
             "CT2_MPS_DISABLE_FLASH_DECODE",
             "CT2_MPS_DISABLE_FLASH_PREFILL",
+            "CT2_MPS_DISABLE_COOPERATIVE_QK",
+            "CT2_MPS_DISABLE_VECTOR_MOE",
+            "CT2_MPS_DISABLE_SMALL_MOE_PLAN",
         ):
             environment.pop(name)
     for device in ("cpu", "mps"):

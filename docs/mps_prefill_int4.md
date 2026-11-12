@@ -235,3 +235,8 @@ reuse routing workspaces, improve long-context attention scheduling and KV
 bandwidth, implement position-aware bounded window-cache eviction, and collect
 GPU counters/isolated timings plus broader model/context/quantization quality
 results. The standard Metal kernels remain behind llama.cpp on this machine.
+
+Subsequent [M1 throughput work](mps_throughput_optimization.md) improves FP16 and
+INT4 expert decode bandwidth, fuses small routing plans, and coalesces compact
+attention key reads. Its new measurements have a separate build scope; the
+historical timing table above is unchanged.

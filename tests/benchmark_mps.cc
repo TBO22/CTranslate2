@@ -11,6 +11,7 @@
 #include "ctranslate2/devices.h"
 #include "ctranslate2/ops/ops.h"
 #include "mps/kernels.h"
+#include "mps/moe.h"
 
 using namespace ctranslate2;
 
@@ -132,6 +133,40 @@ void benchmark_moe_topk() {
       print_result("moe_top2_" + std::to_string(rows) + "x" + std::to_string(experts),
                    benchmark([&]() { route(gpu, ids, weights); }, samples), samples);
     }
+}
+
+// Geometry of the pinned Qwen3 MoE used by the end-to-end benchmark. This
+// includes planning, both expert projections, SwiGLU and ordered aggregation.
+void benchmark_moe_experts() {
+  constexpr dim_t experts = 4, hidden = 1024, intermediate = 3072, topk = 2;
+  const size_t samples = samples_from_env(10);
+  std::vector<std::array<StorageView, 3>> storage;
+  storage.reserve(experts);
+  for (dim_t e = 0; e < experts; ++e)
+    storage.push_back({StorageView({intermediate, hidden}, float16_t(.001f), Device::MPS),
+                       StorageView({intermediate, hidden}, float16_t(.002f), Device::MPS),
+                       StorageView({hidden, intermediate}, float16_t(.003f), Device::MPS)});
+  std::vector<std::array<const StorageView*, 3>> weights;
+  for (const auto& expert : storage)
+    weights.push_back({&expert[0], &expert[1], &expert[2]});
+  for (dim_t rows : {1, 8, 128, 512, 2048}) {
+    StorageView x({rows, hidden}, float16_t(.01f), Device::MPS);
+    std::vector<int32_t> selected(rows * topk);
+    for (dim_t r = 0; r < rows; ++r) {
+      selected[r * topk] = r % experts;
+      selected[r * topk + 1] = (r + 1) % experts;
+    }
+    StorageView ids({rows, topk}, selected, Device::MPS),
+        probabilities({rows, topk}, .5f, Device::MPS),
+        output(DataType::FLOAT16, Device::MPS);
+    print_result("moe_experts_" + std::to_string(rows), benchmark([&]() {
+      mps::moe_forward(x, ids, probabilities, weights, output);
+    }, samples), samples);
+    if (rows <= 8)
+      print_result("moe_plan_legacy_" + std::to_string(rows), benchmark([&]() {
+        mps::moe_forward(x, ids, probabilities, weights, output, false, false, nullptr, true);
+      }, samples), samples);
+  }
 }
 
 void benchmark_moe_fixture(const char* path) {
@@ -290,6 +325,8 @@ int main(int argc, char* argv[]) {
     benchmark_marian_batch_gemms();
   if (requested == "all" || requested == "moe-topk")
     benchmark_moe_topk();
+  if (requested == "moe-experts")
+    benchmark_moe_experts();
   if (requested == "moe-router-file") {
     if (argc != 3)
       throw std::invalid_argument("Usage: benchmark_mps moe-router-file fixture.bin");

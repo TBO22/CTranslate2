@@ -82,7 +82,14 @@ bool flash_decode(DataType dtype, const void* queries, const void* keys,
   if (overlaps(keys, kvbytes) || overlaps(values, kvbytes) ||
       (queries != output && overlaps(queries, qbytes)))
     return false;
-  id<MTLComputePipelineState> state = pipeline("flash_decode_partial");
+  static const bool disable_cooperative_qk = [] {
+    const char* value = std::getenv("CT2_MPS_DISABLE_COOPERATIVE_QK");
+    return value && value[0] && std::string(value) != "0";
+  }();
+  const char* kernel = kv_interleaved && depth >= 64 && !disable_cooperative_qk
+                         ? "flash_decode_partial_cooperative"
+                         : "flash_decode_partial";
+  id<MTLComputePipelineState> state = pipeline(kernel);
   if (state.threadExecutionWidth != 32 ||
       state.maxTotalThreadsPerThreadgroup < 128)
     return false;
@@ -123,7 +130,7 @@ bool flash_decode(DataType dtype, const void* queries, const void* keys,
   [encoder dispatchThreadgroups:MTLSizeMake(splits, matrices, 1)
           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-  record_compute_dispatch("flash_decode_partial");
+  record_compute_dispatch(kernel);
   if (splits > 1) {
     encoder = (__bridge id<MTLComputeCommandEncoder>)compute_encoder();
     [encoder setComputePipelineState:pipeline("flash_decode_merge")];

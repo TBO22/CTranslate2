@@ -101,8 +101,8 @@ void moe_router(DataType dtype, const void* input, const float* router,
 void moe_dispatch_plan(const int32_t* ids, int32_t* offsets,
                        int32_t* permutation, int32_t* inverse,
                        int32_t* indirect, dim_t rows, dim_t experts, dim_t topk,
-                       dim_t hidden, dim_t intermediate, bool decode,
-                       bool wide) {
+                       dim_t hidden, dim_t intermediate, bool decode, bool wide,
+                       bool force_generic) {
   PROFILE("MoeDispatchPlan");
   StreamGuard guard;
   if (rows <= 0 || experts <= 0 || topk <= 0 || topk > experts || hidden <= 0 ||
@@ -114,11 +114,29 @@ void moe_dispatch_plan(const int32_t* ids, int32_t* offsets,
   struct Args {
     uint32_t tokens, experts, topk, hidden, intermediate, decode;
   };
-  const Args args{uint32_t(rows),         uint32_t(experts),
-                  uint32_t(topk),         uint32_t(hidden),
-                  uint32_t(intermediate), decode ? 1u : wide ? 2u : 0u};
+  const Args args{uint32_t(rows),
+                  uint32_t(experts),
+                  uint32_t(topk),
+                  uint32_t(hidden),
+                  uint32_t(intermediate),
+                  decode ? 1u : wide ? 2u : 0u};
   const size_t assignment_bytes = size_t(rows) * topk * sizeof(int32_t);
   const size_t offset_bytes = size_t(experts + 1) * sizeof(int32_t);
+  static const bool disable_small = [] {
+    const char* value = std::getenv("CT2_MPS_DISABLE_SMALL_MOE_PLAN");
+    return value && value[0] && std::string(value) != "0";
+  }();
+  if (decode && rows * topk <= 128 && !force_generic && !disable_small) {
+    run_moe_groups("moe_plan_small", experts,
+                   {{ids, assignment_bytes},
+                    {offsets, offset_bytes},
+                    {permutation, assignment_bytes},
+                    {inverse, assignment_bytes},
+                    {indirect, size_t(experts) * 6 * sizeof(int32_t)}},
+                   &args, sizeof(args), 5);
+    record_profile_detail("native_moe_small_plan");
+    return;
+  }
   run_moe_groups("moe_count", experts,
                  {{ids, assignment_bytes}, {offsets, offset_bytes}}, &args,
                  sizeof(args), 2);
@@ -172,13 +190,17 @@ void moe_expert_project(DataType dtype, const void* input, const void* gate,
   struct Args {
     uint32_t expert, topk, n, k, dtype, gated, vector_loads, int4;
   };
+  static const bool disable_vector = [] {
+    const char* value = std::getenv("CT2_MPS_DISABLE_VECTOR_MOE");
+    return value && value[0] && std::string(value) != "0";
+  }();
   const Args args{uint32_t(expert),
                   uint32_t(topk),
                   uint32_t(n),
                   uint32_t(k),
                   storage,
                   gated ? 1u : 0u,
-                  (k % 8 == 0 &&
+                  ((!decode || !disable_vector) && k % 8 == 0 &&
                    (reinterpret_cast<uintptr_t>(input) & 15u) == 0 &&
                    (reinterpret_cast<uintptr_t>(gate) & 15u) == 0 &&
                    (!gated || (reinterpret_cast<uintptr_t>(up) & 15u) == 0))

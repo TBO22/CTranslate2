@@ -1,5 +1,40 @@
 R"METAL(
 struct MoePlanArgs { uint tokens, experts, topk, hidden, intermediate, decode; };
+// Decode plans fit in one threadgroup. Each expert independently derives its
+// prefix from the selected IDs, then writes its stable grouping and both
+// indirect grids. This replaces count/prefix/group without global atomics.
+kernel void moe_plan_small(device const int* ids [[buffer(0)]], device uint* offsets [[buffer(1)]],
+    device uint* permutation [[buffer(2)]], device uint* inverse [[buffer(3)]],
+    device uint* indirect [[buffer(4)]], constant MoePlanArgs& a [[buffer(5)]],
+    uint expert [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
+  threadgroup uint counts[4], earlier[4];
+  const uint assignments = a.tokens*a.topk;
+  const uint hit = tid < assignments && ids[tid] == int(expert);
+  const uint before = tid < assignments && ids[tid] < int(expert);
+  const uint prefix = simd_prefix_exclusive_sum(hit);
+  const uint count = simd_sum(hit), first = simd_sum(before);
+  if (lane == 0) { counts[simd] = count; earlier[simd] = first; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint start = earlier[0]+earlier[1]+earlier[2]+earlier[3];
+  if (hit) {
+    uint destination = start+prefix;
+    for (uint i = 0; i < simd; ++i) destination += counts[i];
+    permutation[destination] = tid;
+    inverse[tid] = destination;
+  }
+  if (tid == 0) {
+    const uint total = counts[0]+counts[1]+counts[2]+counts[3];
+    offsets[expert] = start;
+    if (expert+1 == a.experts) offsets[expert+1] = assignments;
+    for (uint stage = 0; stage < 2; ++stage) {
+      const uint at = (expert*2+stage)*3;
+      indirect[at] = total ? ((stage ? a.hidden : a.intermediate)+7)/8 : 1;
+      indirect[at+1] = total ? total : 1;
+      indirect[at+2] = 1;
+    }
+  }
+}
 // One group per expert counts routed assignments. Counts never leave the GPU.
 kernel void moe_count(device const int* ids [[buffer(0)]], device uint* offsets [[buffer(1)]],
                        constant MoePlanArgs& a [[buffer(2)]],
@@ -100,6 +135,14 @@ inline float moe_weight(device const uchar* packed, device const float* scales,
   const int q=int((byte>>((col&1)*4))&15)-8;
   return float(half(float(q)*scales[ulong(row)*((a.k+63)/64)+col/64]));
 }
+inline float4 moe_int4_weight4(device const uchar* packed, device const float* scales,
+                               uint row, uint col, uint depth) {
+  const ushort bits = *(device const ushort*)(packed+ulong(row)*(depth/2)+col/2);
+  const int4 q = int4(int(bits&15), int((bits>>4)&15),
+                      int((bits>>8)&15), int((bits>>12)&15))-8;
+  // Four adjacent columns never cross the 64-column quantization group.
+  return float4(half4(float4(q)*scales[ulong(row)*((depth+63)/64)+col/64]));
+}
 // Incremental/small-batch projection: each SIMD group produces two columns.
 // K/V-style contiguous reads reuse each input for paired gate/up projections.
 kernel void moe_expert_gemv(device const uchar* input [[buffer(0)]], device const uchar* gate [[buffer(1)]],
@@ -113,11 +156,30 @@ kernel void moe_expert_gemv(device const uchar* input [[buffer(0)]], device cons
   const uint sorted = first+group.y, token = a.gated ? permutation[sorted]/a.topk : sorted;
   const uint column = (group.x*4+simd)*2;
   float g[2] = {0,0}, u[2] = {0,0};
-  for (uint kk = lane; kk < a.k; kk += 32) {
-    const float x = moe_load(input, ulong(token)*a.k+kk, a.dtype);
-    for (uint j = 0; j < 2; ++j) if (column+j < a.n) {
-      g[j] = fma(x, moe_weight(gate, gate_scale, column+j, kk, a), g[j]);
-      if (a.gated) u[j] = fma(x, moe_weight(up, up_scale, column+j, kk, a), u[j]);
+  if (a.dtype == 1 && a.vector_loads) {
+    // Move the storage-format branches outside the reduction and issue aligned
+    // 64-bit loads. Each SIMD group still owns two adjacent output columns.
+    for (uint kk = lane*4; kk < a.k; kk += 128) {
+      const float4 x = float4(*(device const half4*)((device const half*)input+ulong(token)*a.k+kk));
+      for (uint j = 0; j < 2; ++j) if (column+j < a.n) {
+        const ulong at = ulong(column+j)*a.k+kk;
+        const float4 gv = a.int4 ? moe_int4_weight4(gate, gate_scale, column+j, kk, a.k)
+          : float4(*(device const half4*)((device const half*)gate+at));
+        for (uint el = 0; el < 4; ++el) g[j] = fma(x[el], gv[el], g[j]);
+        if (a.gated) {
+          const float4 uv = a.int4 ? moe_int4_weight4(up, up_scale, column+j, kk, a.k)
+            : float4(*(device const half4*)((device const half*)up+at));
+          for (uint el = 0; el < 4; ++el) u[j] = fma(x[el], uv[el], u[j]);
+        }
+      }
+    }
+  } else {
+    for (uint kk = lane; kk < a.k; kk += 32) {
+      const float x = moe_load(input, ulong(token)*a.k+kk, a.dtype);
+      for (uint j = 0; j < 2; ++j) if (column+j < a.n) {
+        g[j] = fma(x, moe_weight(gate, gate_scale, column+j, kk, a), g[j]);
+        if (a.gated) u[j] = fma(x, moe_weight(up, up_scale, column+j, kk, a), u[j]);
+      }
     }
   }
   for (uint j = 0; j < 2; ++j) {
