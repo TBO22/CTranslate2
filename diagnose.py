@@ -135,10 +135,10 @@ def measure_configuration(args, backend, compute, records, controls):
     try:
         for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
             workers[label] = Worker(python, label, backend, args, compute=compute)
-            for mode in ("natural", "fixed"):
+            for mode in args.modes:
                 workers[label].measure(mode, -1)
         for repeat in range(args.repeats):
-            for mode in ("natural", "fixed"):
+            for mode in args.modes:
                 order = ("baseline", "candidate") if repeat % 2 == 0 else ("candidate", "baseline")
                 pair = []
                 for label in order:
@@ -156,15 +156,16 @@ def measure_configuration(args, backend, compute, records, controls):
             worker.close()
     # Separate uninstrumented controls check that the hook preserves tokens
     # and expose its timing overhead; do not mix these with phase timings.
+    control_mode = "fixed" if "fixed" in args.modes else "natural"
     for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
         worker = Worker(python, label, backend, args, hooks=False, compute=compute)
         try:
-            worker.measure("fixed", -1)
-            control = dict(worker.measure("fixed", 0), backend=backend)
+            worker.measure(control_mode, -1)
+            control = dict(worker.measure(control_mode, 0), backend=backend)
             reference = next(r for r in records if r["backend"] == backend and
-                             r["compute_type"] == compute and r["label"] == label and r["mode"] == "fixed")
+                             r["compute_type"] == compute and r["label"] == label and r["mode"] == control_mode)
             if control["output_sha256"] != reference["output_sha256"]:
-                raise RuntimeError("Phase hooks changed fixed-length token output")
+                raise RuntimeError("Phase hooks changed token output")
             controls.append(control)
             (out / "uninstrumented-controls.json").write_text(json.dumps(controls, indent=2) + "\n")
         finally:
@@ -175,7 +176,7 @@ def run(args):
     out = Path(args.out).resolve()
     records, controls = [], []
     for compute in args.compute_types:
-        for backend in ("mkl-packed", "mkl-unpacked", "dnnl"):
+        for backend in args.backends:
             measure_configuration(args, backend, compute, records, controls)
     summary = []
     groups = sorted({(r["compute_type"], r["backend"], r["mode"], r["label"]) for r in records})
@@ -198,6 +199,10 @@ def main():
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--length", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--backends", nargs="+", choices=["mkl-packed", "mkl-unpacked", "dnnl"],
+                        default=["mkl-packed", "mkl-unpacked", "dnnl"])
+    parser.add_argument("--modes", nargs="+", choices=["natural", "fixed"],
+                        default=["natural", "fixed"])
     parser.add_argument("--compute-types", nargs="+", choices=["int8_float32", "float32"],
                         default=["int8_float32", "float32"])
     args = parser.parse_args()

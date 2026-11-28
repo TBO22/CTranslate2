@@ -11,6 +11,23 @@ on:
         type: boolean
         default: true
         description: Require Intel for qualification; false permits a labeled backend control
+      sample_limit:
+        type: choice
+        options: ['8', '50']
+        default: '8'
+        description: Number of examples from the pinned release-gate selection
+      backend:
+        type: choice
+        options: [all, mkl-packed]
+        default: all
+      mode:
+        type: choice
+        options: [both, natural, fixed]
+        default: both
+      precision:
+        type: choice
+        options: [both, int8_float32, float32]
+        default: both
 
 permissions:
   contents: read
@@ -31,6 +48,10 @@ jobs:
       TOKENIZERS_PARALLELISM: 'false'
       HF_HUB_DISABLE_TELEMETRY: '1'
       DIAG_REQUIRE_INTEL: ${{ inputs.require_intel }}
+      DIAG_SAMPLE_LIMIT: ${{ inputs.sample_limit }}
+      DIAG_BACKEND: ${{ inputs.backend }}
+      DIAG_MODE: ${{ inputs.mode }}
+      DIAG_PRECISION: ${{ inputs.precision }}
     steps:
       - uses: actions/checkout@v5
       - name: Record hardware and enforce qualification requirement
@@ -77,11 +98,28 @@ jobs:
           candidate/bin/python -m pip freeze > results/candidate-requirements.txt
           sha256sum wheels/*-cp312-cp312-manylinux*x86_64.whl > results/candidate-wheel-sha256.txt
       - name: Prepare one shared FP32 model and gate prompts
-        run: baseline/bin/python diagnose.py prepare --out "$PWD/results" --limit 8
+        run: baseline/bin/python diagnose.py prepare --out "$PWD/results" --limit "$DIAG_SAMPLE_LIMIT"
       - name: Build and verify Linux phase hooks
         run: python diagnose.py build --out "$PWD/results" --headers "$PWD/ct2-headers" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python"
-      - name: Alternate base and PR under all three backends
-        run: python diagnose.py run --out "$PWD/results" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python" --length 64 --repeats 3 | tee results/measurements.jsonl
+      - name: Alternate base and PR under requested backends
+        run: |
+          args=(--out "$PWD/results" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python" --length 64 --repeats 3)
+          case "$DIAG_BACKEND" in
+            all) ;;
+            mkl-packed) args+=(--backends mkl-packed) ;;
+            *) exit 1 ;;
+          esac
+          case "$DIAG_MODE" in
+            both) ;;
+            natural|fixed) args+=(--modes "$DIAG_MODE") ;;
+            *) exit 1 ;;
+          esac
+          case "$DIAG_PRECISION" in
+            both) ;;
+            int8_float32|float32) args+=(--compute-types "$DIAG_PRECISION") ;;
+            *) exit 1 ;;
+          esac
+          python diagnose.py run "${args[@]}" | tee results/measurements.jsonl
       - uses: actions/upload-artifact@v4
         if: always()
         with:

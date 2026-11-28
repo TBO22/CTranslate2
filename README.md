@@ -5,6 +5,9 @@ Compare the exact Linux wheel from run 45992420951 (commit 40f8e6a) with 4.9.1
 on one Intel host. Both processes use one FP32 model converted by 4.9.1 and the
 same saved token IDs from the release gate's pinned SQuAD selection. This isolates
 runtime changes from converter changes. The first run uses eight examples.
+The manual inputs can select all 50 gate examples, one precision, packed MKL
+alone and natural stopping alone for a focused follow-up. Defaults retain the
+complete eight-example backend and fixed-length matrix.
 
 The two persistent processes alternate in measurement order and use two CPU
 threads each. Both `int8_float32` and FP32 controls run. Modes are ordinary EOS stopping and exactly 64 decoder outputs
@@ -17,7 +20,8 @@ match between base and candidate or the run fails.
 The Linux ELF timing hooks interpose two existing functions. Their exact symbols
 are verified against both wheel libraries before use. Only entry/exit timing and
 input dimensions are recorded; numerical operations are unchanged. Missing hooks
-or overlapping times fail the run. Uninstrumented fixed-length controls must
+or overlapping times fail the run. Uninstrumented controls (fixed-length when
+requested, otherwise natural stopping) must
 produce identical token sequences and retain their own timing records. These
 controls are not mixed with phase timings. The hook is Linux x86-64 diagnostic
 code, not a portable CT2 API or a production profiling implementation.
