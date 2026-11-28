@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--compute-type", default="int8_float32")
     parser.add_argument("--timers")
     parser.add_argument("--operators", action="store_true")
+    parser.add_argument("--gate-warmup", action="store_true")
     parser.add_argument("--length", type=int, default=64)
     args = parser.parse_args()
     timers = ctypes.CDLL(args.timers) if args.timers else None
@@ -59,6 +60,9 @@ def main():
         if request.get("stop"):
             break
         fixed = request["mode"] == "fixed"
+        current_inputs = inputs
+        if args.gate_warmup and request["repeat"] < 0:
+            current_inputs = inputs[:min(8, max(1, len(inputs) // 2))]
         options = dict(beam_size=2, sampling_topk=1, max_batch_size=8,
                        max_decoding_length=args.length, return_scores=False)
         if fixed:
@@ -67,7 +71,7 @@ def main():
             timers.diag_reset()
         usage_before = resource.getrusage(resource.RUSAGE_SELF)
         start = time.perf_counter_ns()
-        outputs = translator.translate_batch(inputs, **options)
+        outputs = translator.translate_batch(current_inputs, **options)
         wall_ns = time.perf_counter_ns() - start
         usage_after = resource.getrusage(resource.RUSAGE_SELF)
         counts = Counters()
@@ -77,10 +81,13 @@ def main():
                 raise RuntimeError("Timing hooks did not intercept CT2; refusing empty timings")
         hypotheses = [result.hypotheses[0] for result in outputs]
         lengths = list(map(len, hypotheses))
-        if fixed and lengths != [args.length] * len(inputs):
+        if fixed and lengths != [args.length] * len(current_inputs):
             raise RuntimeError(f"Fixed-length contract violated: {lengths}")
+        if not hypotheses or any(not row for row in hypotheses):
+            raise RuntimeError("Generation returned missing or empty completions")
         tokens = sum(lengths)
-        record = dict(request, environment=worker_environment, wall_ns=wall_ns, output_tokens=tokens,
+        record = dict(request, input_examples=len(current_inputs), environment=worker_environment,
+                      wall_ns=wall_ns, output_tokens=tokens,
                       tokens_per_second=tokens * 1e9 / wall_ns,
                       output_lengths=lengths, hypotheses=hypotheses,
                       scores=[r.scores for r in outputs],

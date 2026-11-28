@@ -22,7 +22,7 @@ on:
         default: all
       mode:
         type: choice
-        options: [both, natural, fixed, provenance]
+        options: [both, natural, fixed, gate-natural, gate-fixed, provenance]
         default: both
       precision:
         type: choice
@@ -143,6 +143,8 @@ jobs:
           case "$DIAG_MODE" in
             both) ;;
             natural|fixed) args+=(--modes "$DIAG_MODE") ;;
+            gate-natural) args+=(--modes natural --fresh-processes) ;;
+            gate-fixed) args+=(--modes fixed --fresh-processes) ;;
             *) exit 1 ;;
           esac
           case "$DIAG_PRECISION" in

@@ -129,7 +129,7 @@ def build(args):
 
 
 class Worker:
-    def __init__(self, python, label, backend, args, hooks=True, compute="int8_float32"):
+    def __init__(self, python, label, backend, args, hooks=True, compute="int8_float32", tag=""):
         out = Path(args.out).resolve()
         libs = json.loads((out / "libraries.json").read_text())
         env = dict(os.environ, CT2_USE_MKL="0" if backend == "dnnl" else "1",
@@ -141,6 +141,8 @@ class Worker:
         command = [python, "-u", str(HERE / "worker.py"), "--model", str(out / "model"),
                    "--inputs", str(out / "inputs.json"), "--length", str(args.length),
                    "--compute-type", compute]
+        if args.fresh_processes:
+            command += ["--gate-warmup"]
         if hooks:
             library_label = "candidate" if args.candidate_ablation else label
             env.update(LD_PRELOAD=str(out / "timing_hooks.so"), CT2_DIAG_LIBRARY=libs[library_label])
@@ -150,7 +152,9 @@ class Worker:
                 command += ["--operators"]
             if (args.legacy_allocation or args.candidate_ablation) and label == "candidate":
                 env["CT2_DIAG_LEGACY_ALLOCATION"] = "1"
-        self.log_path = out / f"{backend}-{compute}-{label}-hooks{int(hooks)}.log"
+        self.log_path = out / f"{backend}-{compute}-{label}-hooks{int(hooks)}{tag}.log"
+        self.warmup_path = out / "warmups.jsonl"
+        self.backend = backend
         self.log = open(self.log_path, "w")
         self.process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=self.log, text=True)
@@ -174,7 +178,12 @@ class Worker:
     def measure(self, mode, repeat):
         self.process.stdin.write(json.dumps({"mode": mode, "repeat": repeat}) + "\n")
         self.process.stdin.flush()
-        return dict(self.read(), label=self.label, compute_type=self.ready["compute_type"])
+        record = dict(self.read(), label=self.label, backend=self.backend,
+                      compute_type=self.ready["compute_type"])
+        if repeat < 0:
+            with self.warmup_path.open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+        return record
 
     def close(self):
         if self.process.poll() is None:
@@ -189,17 +198,30 @@ def measure_configuration(args, backend, compute, records, controls):
     workers = {}
     baseline_python = args.candidate_python if args.candidate_ablation else args.baseline_python
     runtimes = (("baseline", baseline_python), ("candidate", args.candidate_python))
+    def measure_one(label, mode, repeat):
+        if not args.fresh_processes:
+            return workers[label].measure(mode, repeat)
+        python = dict(runtimes)[label]
+        worker = Worker(python, label, backend, args, compute=compute,
+                        tag=f"-{mode}-repeat{repeat}")
+        try:
+            worker.measure(mode, -1)
+            return worker.measure(mode, repeat)
+        finally:
+            worker.close()
     try:
-        for label, python in runtimes:
-            workers[label] = Worker(python, label, backend, args, compute=compute)
-            for mode in args.modes:
-                workers[label].measure(mode, -1)
+        if not args.fresh_processes:
+            for label, python in runtimes:
+                workers[label] = Worker(python, label, backend, args, compute=compute)
+                for mode in args.modes:
+                    workers[label].measure(mode, -1)
         for repeat in range(args.repeats):
             for mode in args.modes:
                 order = ("baseline", "candidate") if repeat % 2 == 0 else ("candidate", "baseline")
                 pair = []
                 for label in order:
-                    record = dict(workers[label].measure(mode, repeat), backend=backend,
+                    record = dict(measure_one(label, mode, repeat), backend=backend,
+                                  worker_lifecycle="fresh" if args.fresh_processes else "persistent",
                                   comparison="candidate allocation on/off" if args.candidate_ablation else "4.9.1 vs candidate wheel")
                     records.append(record)
                     pair.append(record)
@@ -268,6 +290,8 @@ def main():
                         help="Candidate-only ablation restoring the removed length-buffer lifetime")
     parser.add_argument("--candidate-ablation", action="store_true",
                         help="Use the candidate binary for both labels; toggle only the legacy allocation")
+    parser.add_argument("--fresh-processes", action="store_true",
+                        help="Start each measurement in a fresh worker and match the gate's warm-up batch")
     parser.add_argument("--backends", nargs="+", choices=["mkl-packed", "mkl-unpacked", "dnnl"],
                         default=["mkl-packed", "mkl-unpacked", "dnnl"])
     parser.add_argument("--modes", nargs="+", choices=["natural", "fixed"],
