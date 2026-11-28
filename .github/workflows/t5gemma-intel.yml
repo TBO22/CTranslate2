@@ -1,0 +1,63 @@
+name: T5Gemma Intel investigation
+
+on:
+  push:
+    branches: [diagnose/t5gemma-intel-throughput]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  investigate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '2'
+      TOKENIZERS_PARALLELISM: 'false'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - name: Require Intel host
+        run: |
+          mkdir -p results
+          lscpu | tee results/hardware.txt
+          grep -q GenuineIntel /proc/cpuinfo || { echo 'An Intel runner is required; rerun this job.'; exit 1; }
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Download exact candidate wheels from the reported run
+        run: |
+          gh run download 45992420951 --repo OpenNMT/CTranslate2 --name python-wheels-Linux-auto64 --dir wheels
+          gh api repos/OpenNMT/CTranslate2/actions/runs/45992420951 > results/candidate-run.json
+      - name: Install shared source-model dependencies and isolated CT2 wheels
+        run: |
+          python -m pip install 'torch==2.15.0' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'transformers==5.24.0' 'datasets==5.1.0' 'sentencepiece==0.2.3'
+          python -m venv --system-site-packages baseline
+          python -m venv --system-site-packages candidate
+          baseline/bin/python -m pip install 'ctranslate2==4.9.1'
+          candidate/bin/python -m pip install wheels/*-cp312-cp312-manylinux*x86_64.whl
+          baseline/bin/python -m pip freeze > results/baseline-requirements.txt
+          candidate/bin/python -m pip freeze > results/candidate-requirements.txt
+          sha256sum wheels/*-cp312-cp312-manylinux*x86_64.whl > results/candidate-wheel-sha256.txt
+      - name: Prepare one shared FP32 model and gate prompts
+        run: baseline/bin/python diagnose.py prepare --out "$PWD/results" --limit 8
+      - name: Build and verify Linux phase hooks
+        run: python diagnose.py build --out "$PWD/results" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python"
+      - name: Alternate base and PR under all three backends
+        run: python diagnose.py run --out "$PWD/results" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python" --length 64 --repeats 3 | tee results/measurements.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t5gemma-intel-diagnosis
+          retention-days: 7
+          path: |
+            results/*.json
+            results/*.jsonl
+            results/*.log
+            results/*.txt
