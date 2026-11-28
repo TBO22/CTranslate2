@@ -200,7 +200,7 @@ def measure_configuration(args, backend, compute, records, controls):
                 pair = []
                 for label in order:
                     record = dict(workers[label].measure(mode, repeat), backend=backend,
-                                  comparison="candidate allocation on/off" if args.candidate_ablation else "4.9.1 vs reported PR")
+                                  comparison="candidate allocation on/off" if args.candidate_ablation else "4.9.1 vs candidate wheel")
                     records.append(record)
                     pair.append(record)
                     if args.operators and label == "candidate" and not record["operators"]["decoder_mask_calls"]:
