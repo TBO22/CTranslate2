@@ -37,6 +37,8 @@ def prepare(args):
     manifest = {"model_sha256": model_sha256,
                 "inputs_sha256": hashlib.sha256((out / "inputs.json").read_bytes()).hexdigest(),
                 "prompt_lengths": list(map(len, ids)), "conversion_version": __import__("ctranslate2").__version__}
+    converter_file = sys.modules[TransformersConverter.__module__].__file__
+    manifest["converter_sha256"] = hashlib.sha256(Path(converter_file).read_bytes()).hexdigest()
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 

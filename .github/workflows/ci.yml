@@ -127,7 +127,9 @@ jobs:
         run: python diagnose.py inspect --out "$PWD/results" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python"
       - name: Prepare one shared FP32 model and gate prompts
         if: ${{ inputs.mode != 'provenance' }}
-        run: baseline/bin/python diagnose.py prepare --out "$PWD/results" --limit "$DIAG_SAMPLE_LIMIT"
+        run: |
+          if [ "$DIAG_CANDIDATE_RUN" = 45992420951 ]; then prepare_python=baseline/bin/python; else prepare_python=candidate/bin/python; fi
+          "$prepare_python" diagnose.py prepare --out "$PWD/results" --limit "$DIAG_SAMPLE_LIMIT"
       - name: Build and verify Linux phase hooks
         if: ${{ inputs.mode != 'provenance' }}
         run: python diagnose.py build --out "$PWD/results" --headers "$PWD/ct2-headers" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python"
