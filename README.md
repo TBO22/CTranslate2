@@ -9,6 +9,18 @@ The manual inputs can select all 50 gate examples, one precision, packed MKL
 alone and natural stopping alone for a focused follow-up. Defaults retain the
 complete eight-example backend and fixed-length matrix.
 
+`candidate_run` selects the exact wheel-producing Actions run. The historical
+default is the reported upstream run. Other IDs are fetched from the fork and
+use a model converted once with the candidate converter, shared by both
+runtimes. The converter file, model, inputs and native libraries are hashed.
+Do not compare absolute rates across experiments with different model hashes.
+
+For release-gate lifecycle qualification, use `gate-fixed` and `gate-natural`.
+These start each measurement in a fresh worker with the gate's warm-up batch
+(eight examples for a 50-example selection), then time the full selection.
+The ordinary `fixed` and `natural` modes retain persistent paired workers for
+operator investigations. Warm-up records are saved separately.
+
 The compared Python wheels both report version 4.9.1. Their native-library hashes
 and the exact candidate Actions run identify them; do not use the version string
 to conclude that the binaries are identical.
@@ -54,8 +66,15 @@ packed-MKL fixed-work measurements reproduced an 11.02% throughput drop; the new
 mask itself took only 4.196 ms for the complete request. A further copy breakdown
 localized most extra time to Tile and Concat. The default page-fault probe
 records about 16.3 million minor faults in baseline versus 19.4 million in PR.
-The exact allocation-history mechanism is still under investigation. These
-results do not clear the originally reported 30 to 38 percent Intel regression.
+The allocation ablation has now completed: with the same candidate binary and
+identical token output, restoring the removed length-buffer allocation improved
+median fixed-work throughput by 12.89% over six paired requests. Tile minor
+faults fell from about 5.71 million to 2.94 million. One late allocation-off
+request became fast, so allocation history and raw variability remain relevant.
+This diagnostic allocation is not a production fix. A separate production
+candidate restores useful CPU length-aware softmax while retaining explicit
+causal/window masking. Its exact wheel requires fresh-process, full-selection
+Intel qualification before the regression can be considered resolved.
 The standalone 50-example natural-stopping run and focused profiles completed;
 the initial full backend matrices were interrupted deliberately to save partial
 results before timeout and must not be reported as completed CI qualification.
