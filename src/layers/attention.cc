@@ -11,6 +11,7 @@
 #include <numeric>
 #include <cstdint>
 #include <stdexcept>
+#include <limits>
 
 #include "dispatch.h"
 #include "cpu/parallel.h"
@@ -895,6 +896,26 @@ namespace ctranslate2 {
           (memory_lengths_mask && memory_lengths_mask->size() != rows))
         throw std::invalid_argument(
             "Merged attention length mask does not match query rows");
+
+      // CPU softmax can exclude the contiguous encoder padding directly.
+      // Keep the causal/window holes in decoder keys in the explicit mask:
+      // their valid count cannot be added to the encoder length.
+      std::unique_ptr<StorageView> merged_lengths;
+      const dim_t self_size = keys_proj.dim(2);
+      const dim_t memory_size = memory_keys.dim(2);
+      if (device == Device::CPU
+          && self_size + memory_size <= std::numeric_limits<int32_t>::max()) {
+        merged_lengths = std::make_unique<StorageView>(Shape{rows}, DataType::INT32, device);
+        auto* lengths = merged_lengths->data<int32_t>();
+        const auto* memory_lengths =
+          memory_lengths_mask ? memory_lengths_mask->data<int32_t>() : nullptr;
+        for (dim_t row = 0; row < rows; ++row) {
+          const dim_t memory_end = memory_lengths
+            ? std::clamp<dim_t>(memory_lengths[row], 0, memory_size)
+            : memory_size;
+          lengths[row] = static_cast<int32_t>(self_size + memory_end);
+        }
+      }
       StorageView context(dtype, device);
       const ops::MatMul keys_matmul(false, true, _queries_scale);
       keys_matmul(queries_proj, merged_keys, context);
@@ -903,12 +924,12 @@ namespace ctranslate2 {
           (primitives<D>::mask_merged_attention(
               context.data<T>(),
               self_lengths_mask ? self_lengths_mask->data<int32_t>() : nullptr,
-              memory_lengths_mask ? memory_lengths_mask->data<int32_t>()
-                                  : nullptr,
+              !merged_lengths && memory_lengths_mask
+                ? memory_lengths_mask->data<int32_t>() : nullptr,
               rows, keys_proj.dim(2), memory_keys.dim(2), queries_proj.dim(2),
               offset, _sliding_window)));
       StorageView attn(dtype, device);
-      ops::SoftMax()(context, attn);
+      ops::SoftMax()(context, merged_lengths.get(), attn);
       const ops::MatMul values_matmul;
       values_matmul(attn, merged_values, context);
 
