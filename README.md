@@ -32,7 +32,10 @@ phase timings remain unvalidated. The first dispatch was rejected with
 Actions and the diagnostic is being retried. No Intel timing result is claimed
 until an actual Intel run completes.
 
-The Intel hardware check fails early on an AMD runner. A successful AMD run is
-not evidence that the Intel issue is fixed. All raw data, wheel provenance,
+The Intel hardware check fails early on an AMD runner. Explicitly selecting
+`require_intel=false` permits a labeled same-host backend control on another CPU;
+it can help isolate MKL dependence but does not qualify the Intel issue. The
+workflow is manually dispatched and supports the Ubuntu 22.04 and 24.04 pools.
+A successful AMD run is not evidence that the Intel issue is fixed. All raw data, wheel provenance,
 dependency versions and hardware information are uploaded. No PR is merged or
 closed by this workflow.

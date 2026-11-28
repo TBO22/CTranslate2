@@ -1,9 +1,16 @@
-name: T5Gemma Intel investigation
+name: T5Gemma CPU throughput investigation
 
 on:
-  push:
-    branches: [diagnose/t5gemma-intel-throughput]
   workflow_dispatch:
+    inputs:
+      runner_os:
+        type: choice
+        options: [ubuntu-22.04, ubuntu-24.04]
+        default: ubuntu-22.04
+      require_intel:
+        type: boolean
+        default: true
+        description: Require Intel for qualification; false permits a labeled backend control
 
 permissions:
   contents: read
@@ -11,7 +18,7 @@ permissions:
 
 jobs:
   investigate:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.runner_os }}
     timeout-minutes: 60
     defaults:
       run:
@@ -23,13 +30,19 @@ jobs:
       OPENBLAS_NUM_THREADS: '2'
       TOKENIZERS_PARALLELISM: 'false'
       HF_HUB_DISABLE_TELEMETRY: '1'
+      DIAG_REQUIRE_INTEL: ${{ inputs.require_intel }}
     steps:
       - uses: actions/checkout@v5
-      - name: Require Intel host
+      - name: Record hardware and enforce qualification requirement
         run: |
           mkdir -p results
           lscpu | tee results/hardware.txt
-          grep -q GenuineIntel /proc/cpuinfo || { echo 'An Intel runner is required; rerun this job.'; exit 1; }
+          if [ "$DIAG_REQUIRE_INTEL" = true ]; then
+            grep -q GenuineIntel /proc/cpuinfo || { echo 'An Intel runner is required; rerun this job.'; exit 1; }
+            echo 'Intel qualification' > results/qualification.txt
+          else
+            echo 'Backend control; does not qualify the Intel regression' | tee results/qualification.txt
+          fi
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
