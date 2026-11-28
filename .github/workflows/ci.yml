@@ -1,4 +1,5 @@
 name: T5Gemma CPU throughput investigation
+run-name: T5Gemma ${{ inputs.backend }} ${{ inputs.mode }} ${{ inputs.precision }} wheel ${{ inputs.candidate_run }}
 
 on:
   workflow_dispatch:
