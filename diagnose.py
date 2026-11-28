@@ -95,12 +95,19 @@ class Worker:
         if hooks:
             env.update(LD_PRELOAD=str(out / "timing_hooks.so"), CT2_DIAG_LIBRARY=libs[label])
             command += ["--timers", str(out / "timing_hooks.so")]
-        self.log = open(out / f"{backend}-{compute}-{label}-hooks{int(hooks)}.log", "w")
+        self.log_path = out / f"{backend}-{compute}-{label}-hooks{int(hooks)}.log"
+        self.log = open(self.log_path, "w")
         self.process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=self.log, text=True)
         self.ready = self.read()
         if not self.ready.get("ready"):
             raise RuntimeError(self.ready)
+        expected = ("DNNL (packed: false)" if backend == "dnnl" else
+                    f"MKL (packed: {'true' if backend == 'mkl-packed' else 'false'})")
+        if f"SGEMM backend: {expected}" not in self.log_path.read_text():
+            self.process.terminate()
+            self.process.wait(timeout=30)
+            raise RuntimeError(f"Expected backend {expected}; see {self.log_path}")
         self.label = label
 
     def read(self):
@@ -112,7 +119,7 @@ class Worker:
     def measure(self, mode, repeat):
         self.process.stdin.write(json.dumps({"mode": mode, "repeat": repeat}) + "\n")
         self.process.stdin.flush()
-        return dict(self.read(), label=self.label)
+        return dict(self.read(), label=self.label, compute_type=self.ready["compute_type"])
 
     def close(self):
         if self.process.poll() is None:
@@ -122,58 +129,62 @@ class Worker:
         self.log.close()
 
 
+def measure_configuration(args, backend, compute, records, controls):
+    out = Path(args.out).resolve()
+    workers = {}
+    try:
+        for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
+            workers[label] = Worker(python, label, backend, args, compute=compute)
+            for mode in ("natural", "fixed"):
+                workers[label].measure(mode, -1)
+        for repeat in range(args.repeats):
+            for mode in ("natural", "fixed"):
+                order = ("baseline", "candidate") if repeat % 2 == 0 else ("candidate", "baseline")
+                pair = []
+                for label in order:
+                    record = dict(workers[label].measure(mode, repeat), backend=backend)
+                    records.append(record)
+                    pair.append(record)
+                    print(json.dumps({k: v for k, v in record.items() if k not in ("hypotheses", "scores")}), flush=True)
+                    (out / "measurements.json").write_text(json.dumps(records, indent=2) + "\n")
+                if mode == "fixed":
+                    for field in ("output_tokens", "encoder_calls", "decoder_calls", "decoder_row_steps", "max_step_plus_one"):
+                        if pair[0][field] != pair[1][field]:
+                            raise RuntimeError(f"Unequal fixed work for {field}: {pair}")
+    finally:
+        for worker in workers.values():
+            worker.close()
+    # Separate uninstrumented controls check that the hook preserves tokens
+    # and expose its timing overhead; do not mix these with phase timings.
+    for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
+        worker = Worker(python, label, backend, args, hooks=False, compute=compute)
+        try:
+            worker.measure("fixed", -1)
+            control = dict(worker.measure("fixed", 0), backend=backend)
+            reference = next(r for r in records if r["backend"] == backend and
+                             r["compute_type"] == compute and r["label"] == label and r["mode"] == "fixed")
+            if control["output_sha256"] != reference["output_sha256"]:
+                raise RuntimeError("Phase hooks changed fixed-length token output")
+            controls.append(control)
+            (out / "uninstrumented-controls.json").write_text(json.dumps(controls, indent=2) + "\n")
+        finally:
+            worker.close()
+
+
 def run(args):
     out = Path(args.out).resolve()
-    records = []
-    controls = []
-    for backend in ("mkl-packed", "mkl-unpacked", "dnnl"):
-        workers = {}
-        try:
-            for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
-                workers[label] = Worker(python, label, backend, args)
-                for mode in ("natural", "fixed"):
-                    workers[label].measure(mode, -1)
-            for repeat in range(args.repeats):
-                for mode in ("natural", "fixed"):
-                    order = ("baseline", "candidate") if repeat % 2 == 0 else ("candidate", "baseline")
-                    pair = []
-                    for label in order:
-                        record = dict(workers[label].measure(mode, repeat), backend=backend)
-                        records.append(record)
-                        pair.append(record)
-                        print(json.dumps({k: v for k, v in record.items() if k not in ("hypotheses", "scores")}), flush=True)
-                        (out / "measurements.json").write_text(json.dumps(records, indent=2) + "\n")
-                    if mode == "fixed":
-                        for field in ("output_tokens", "encoder_calls", "decoder_calls", "decoder_row_steps", "max_step_plus_one"):
-                            if pair[0][field] != pair[1][field]:
-                                raise RuntimeError(f"Unequal fixed work for {field}: {pair}")
-        finally:
-            for worker in workers.values():
-                worker.close()
-        # Separate uninstrumented controls check that the hook preserves tokens
-        # and expose its timing overhead; do not mix these with phase timings.
-        for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
-            worker = Worker(python, label, backend, args, hooks=False)
-            try:
-                worker.measure("fixed", -1)
-                control = dict(worker.measure("fixed", 0), backend=backend)
-                reference = next(r for r in records if r["backend"] == backend and
-                                 r["label"] == label and r["mode"] == "fixed")
-                if control["output_sha256"] != reference["output_sha256"]:
-                    raise RuntimeError("Phase hooks changed fixed-length token output")
-                controls.append(control)
-                (out / "uninstrumented-controls.json").write_text(json.dumps(controls, indent=2) + "\n")
-            finally:
-                worker.close()
+    records, controls = [], []
+    for compute in args.compute_types:
+        for backend in ("mkl-packed", "mkl-unpacked", "dnnl"):
+            measure_configuration(args, backend, compute, records, controls)
     summary = []
-    for backend in ("mkl-packed", "mkl-unpacked", "dnnl"):
-        for mode in ("natural", "fixed"):
-            for label in ("baseline", "candidate"):
-                rows = [r for r in records if (r["backend"], r["mode"], r["label"]) == (backend, mode, label)]
-                summary.append(dict(backend=backend, mode=mode, label=label, **{
-                    key: statistics.median(row[key] for row in rows) for key in (
-                        "wall_ns", "output_tokens", "tokens_per_second", "encoder_ns", "decoder_ns",
-                        "other_ns", "decoder_calls", "decoder_row_steps")}))
+    groups = sorted({(r["compute_type"], r["backend"], r["mode"], r["label"]) for r in records})
+    for compute, backend, mode, label in groups:
+        rows = [r for r in records if (r["compute_type"], r["backend"], r["mode"], r["label"]) == (compute, backend, mode, label)]
+        summary.append(dict(compute_type=compute, backend=backend, mode=mode, label=label, **{
+            key: statistics.median(row[key] for row in rows) for key in (
+                "wall_ns", "output_tokens", "tokens_per_second", "encoder_ns", "decoder_ns",
+                "other_ns", "decoder_calls", "decoder_row_steps")}))
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
@@ -187,6 +198,8 @@ def main():
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--length", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--compute-types", nargs="+", choices=["int8_float32", "float32"],
+                        default=["int8_float32", "float32"])
     args = parser.parse_args()
     {"prepare": prepare, "build": build, "run": run}[args.action](args)
 

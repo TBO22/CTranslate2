@@ -7,7 +7,7 @@ same saved token IDs from the release gate's pinned SQuAD selection. This isolat
 runtime changes from converter changes. The first run uses eight examples.
 
 The two persistent processes alternate in measurement order and use two CPU
-threads each. Modes are ordinary EOS stopping and exactly 64 decoder outputs
+threads each. Both `int8_float32` and FP32 controls run. Modes are ordinary EOS stopping and exactly 64 decoder outputs
 with EOS disabled. Backends are packed MKL, unpacked MKL and oneDNN, selected in
 fresh processes because CT2 caches backend settings. Each result includes full
 tokens, returned counts, request time, encoder time, decoder time, decoder call
@@ -21,6 +21,16 @@ or overlapping times fail the run. Uninstrumented fixed-length controls must
 produce identical token sequences and retain their own timing records. These
 controls are not mixed with phase timings. The hook is Linux x86-64 diagnostic
 code, not a portable CT2 API or a production profiling implementation.
+
+## Current execution status
+
+The scripts pass local Python syntax checks, the C++ hook compiles with warnings
+treated as errors, and the worker protocol and fixed-length token accounting
+pass with a real local T5Gemma2 CPU model. Linux symbol interposition and Intel
+phase timings remain unvalidated. The first dispatch was rejected with
+`Actions has been disabled for this repository`; the owner has since enabled
+Actions and the diagnostic is being retried. No Intel timing result is claimed
+until an actual Intel run completes.
 
 The Intel hardware check fails early on an AMD runner. A successful AMD run is
 not evidence that the Intel issue is fixed. All raw data, wheel provenance,

@@ -13,6 +13,9 @@ jobs:
   investigate:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
     env:
       GH_TOKEN: ${{ github.token }}
       OMP_NUM_THREADS: '2'
