@@ -15,6 +15,13 @@ use a model converted once with the candidate converter, shared by both
 runtimes. The converter file, model, inputs and native libraries are hashed.
 Do not compare absolute rates across experiments with different model hashes.
 
+`candidate_run=46149015735:45992420951` compares the production candidate with
+the exact unpatched masking runtime, using the candidate converter for the
+one shared model. Baseline and candidate run metadata and wheel hashes are
+both retained. The unpatched runtime source matches current PR #2175 head;
+this comparison measures the CPU softmax change directly rather than inferring
+its effect from the published-release gap.
+
 For release-gate lifecycle qualification, use `gate-fixed` and `gate-natural`.
 These start each measurement in a fresh worker with the gate's warm-up batch
 (eight examples for a 50-example selection), then time the full selection.

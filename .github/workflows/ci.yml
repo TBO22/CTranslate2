@@ -45,7 +45,7 @@ on:
       candidate_run:
         type: string
         default: '45992420951'
-        description: Actions run containing the candidate Linux wheels in TBO22 or OpenNMT
+        description: Candidate wheel run, optionally candidate:baseline to compare two exact wheels
 
 permissions:
   contents: read
@@ -108,9 +108,19 @@ jobs:
           sha256sum ct2-headers/include/ctranslate2/storage_view.h > results/storage-view-header-sha256.txt
       - name: Download exact candidate wheels from the reported run
         run: |
-          if [ "$DIAG_CANDIDATE_RUN" = 45992420951 ]; then source_repo=OpenNMT/CTranslate2; else source_repo=TBO22/CTranslate2; fi
-          gh run download "$DIAG_CANDIDATE_RUN" --repo "$source_repo" --name python-wheels-Linux-auto64 --dir wheels
-          gh api "repos/$source_repo/actions/runs/$DIAG_CANDIDATE_RUN" > results/candidate-run.json
+          candidate_id=${DIAG_CANDIDATE_RUN%%:*}
+          [[ "$candidate_id" =~ ^[0-9]+$ ]] || exit 1
+          if [ "$candidate_id" = 45992420951 ]; then source_repo=OpenNMT/CTranslate2; else source_repo=TBO22/CTranslate2; fi
+          gh run download "$candidate_id" --repo "$source_repo" --name python-wheels-Linux-auto64 --dir wheels
+          gh api "repos/$source_repo/actions/runs/$candidate_id" > results/candidate-run.json
+          if [[ "$DIAG_CANDIDATE_RUN" == *:* ]]; then
+            baseline_id=${DIAG_CANDIDATE_RUN#*:}
+            [[ "$baseline_id" =~ ^[0-9]+$ ]] || exit 1
+            if [ "$baseline_id" = 45992420951 ]; then source_repo=OpenNMT/CTranslate2; else source_repo=TBO22/CTranslate2; fi
+            gh run download "$baseline_id" --repo "$source_repo" --name python-wheels-Linux-auto64 --dir baseline-wheels
+            gh api "repos/$source_repo/actions/runs/$baseline_id" > results/baseline-run.json
+            sha256sum baseline-wheels/*-cp312-cp312-manylinux*x86_64.whl > results/baseline-wheel-sha256.txt
+          fi
       - name: Install shared source-model dependencies and isolated CT2 wheels
         run: |
           if [ "$DIAG_PROVENANCE_ONLY" != true ]; then
@@ -119,7 +129,11 @@ jobs:
           fi
           python -m venv --system-site-packages baseline
           python -m venv --system-site-packages candidate
-          baseline/bin/python -m pip install 'ctranslate2==4.9.1'
+          if [[ "$DIAG_CANDIDATE_RUN" == *:* ]]; then
+            baseline/bin/python -m pip install baseline-wheels/*-cp312-cp312-manylinux*x86_64.whl
+          else
+            baseline/bin/python -m pip install 'ctranslate2==4.9.1'
+          fi
           candidate/bin/python -m pip install wheels/*-cp312-cp312-manylinux*x86_64.whl
           baseline/bin/python -m pip freeze > results/baseline-requirements.txt
           candidate/bin/python -m pip freeze > results/candidate-requirements.txt
