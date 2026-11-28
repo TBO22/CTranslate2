@@ -70,6 +70,39 @@ def symbols(path):
     return result
 
 
+def inspect(args):
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    metadata = {}
+    for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
+        lib = library(python)
+        script = '''import ctypes, json, sys, ctranslate2
+library = ctypes.CDLL(sys.argv[1])
+result = {"ctranslate2_version": ctranslate2.__version__, "mkl_version": None}
+for name in ("MKL_Get_Version_String", "mkl_get_version_string"):
+    try:
+        call = getattr(library, name)
+    except AttributeError:
+        continue
+    call.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    call.restype = None
+    buffer = ctypes.create_string_buffer(512)
+    call(buffer, len(buffer))
+    result["mkl_version"] = buffer.value.decode()
+    break
+print(json.dumps(result))
+'''
+        record = json.loads(subprocess.check_output([python, "-c", script, lib], text=True))
+        record["dependencies"] = subprocess.check_output(["ldd", lib], text=True)
+        compiler = subprocess.run(["readelf", "-p", ".comment", lib], text=True, capture_output=True)
+        record["compiler_comments"] = compiler.stdout
+        with open(lib, "rb") as stream:
+            record["library_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        metadata[label] = record
+    (out / "native-provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(json.dumps(metadata, indent=2))
+
+
 def build(args):
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -208,7 +241,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["prepare", "build", "run"])
+    parser.add_argument("action", choices=["prepare", "build", "run", "inspect"])
     parser.add_argument("--out", required=True)
     parser.add_argument("--baseline-python")
     parser.add_argument("--candidate-python")
@@ -226,7 +259,7 @@ def main():
     parser.add_argument("--compute-types", nargs="+", choices=["int8_float32", "float32"],
                         default=["int8_float32", "float32"])
     args = parser.parse_args()
-    {"prepare": prepare, "build": build, "run": run}[args.action](args)
+    {"prepare": prepare, "build": build, "run": run, "inspect": inspect}[args.action](args)
 
 
 if __name__ == "__main__":
