@@ -27,6 +27,10 @@ These start each measurement in a fresh worker with the gate's warm-up batch
 (eight examples for a 50-example selection), then time the full selection.
 The ordinary `fixed` and `natural` modes retain persistent paired workers for
 operator investigations. Warm-up records are saved separately.
+Use `operators=none` for repeated bare inference: the probe library is not
+loaded and no phase timing is claimed. This is necessary for allocation-sensitive
+performance conclusions; token-preserving interposition can still perturb heap
+history and timing. `true` enables operator attribution and `false` phase timing.
 
 The compared Python wheels both report version 4.9.1. Their native-library hashes
 and the exact candidate Actions run identify them; do not use the version string

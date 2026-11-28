@@ -51,7 +51,7 @@ def main():
                           "MKL_NUM_THREADS", "CT2_FORCE_CPU_ISA",
                           "MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_",
                           "CT2_DIAG_LEGACY_ALLOCATION", "CT2_DIAG_LIBRARY",
-                          "DIAG_CANDIDATE_RUN")}
+                          "DIAG_CANDIDATE_RUN", "LD_PRELOAD")}
     print(json.dumps({"ready": True, "version": ctranslate2.__version__,
                       "compute_type": translator.compute_type,
                       "environment": worker_environment}), flush=True)

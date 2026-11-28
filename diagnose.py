@@ -154,6 +154,10 @@ class Worker:
                 command += ["--operators"]
             if (args.legacy_allocation or args.candidate_ablation) and label == "candidate":
                 env["CT2_DIAG_LEGACY_ALLOCATION"] = "1"
+        else:
+            for name in ("LD_PRELOAD", "CT2_DIAG_LIBRARY", "CT2_DIAG_OPERATORS",
+                         "CT2_DIAG_LEGACY_ALLOCATION"):
+                env.pop(name, None)
         self.log_path = out / f"{backend}-{compute}-{label}-hooks{int(hooks)}{tag}.log"
         self.warmup_path = out / "warmups.jsonl"
         self.backend = backend
@@ -204,7 +208,7 @@ def measure_configuration(args, backend, compute, records, controls):
         if not args.fresh_processes:
             return workers[label].measure(mode, repeat)
         python = dict(runtimes)[label]
-        worker = Worker(python, label, backend, args, compute=compute,
+        worker = Worker(python, label, backend, args, compute=compute, hooks=not args.no_hooks,
                         tag=f"-{mode}-repeat{repeat}")
         try:
             worker.measure(mode, -1)
@@ -214,7 +218,7 @@ def measure_configuration(args, backend, compute, records, controls):
     try:
         if not args.fresh_processes:
             for label, python in runtimes:
-                workers[label] = Worker(python, label, backend, args, compute=compute)
+                workers[label] = Worker(python, label, backend, args, compute=compute, hooks=not args.no_hooks)
                 for mode in args.modes:
                     workers[label].measure(mode, -1)
         for repeat in range(args.repeats):
@@ -224,7 +228,7 @@ def measure_configuration(args, backend, compute, records, controls):
                 for label in order:
                     record = dict(measure_one(label, mode, repeat), backend=backend,
                                   worker_lifecycle="fresh" if args.fresh_processes else "persistent",
-                                  comparison="candidate allocation on/off" if args.candidate_ablation else "4.9.1 vs candidate wheel")
+                                  comparison="candidate allocation on/off" if args.candidate_ablation else "exact runtime comparison")
                     records.append(record)
                     pair.append(record)
                     if args.operators and label == "candidate" and not record["operators"]["decoder_mask_calls"]:
@@ -232,7 +236,9 @@ def measure_configuration(args, backend, compute, records, controls):
                     print(json.dumps({k: v for k, v in record.items() if k not in ("hypotheses", "scores")}), flush=True)
                     (out / "measurements.json").write_text(json.dumps(records, indent=2) + "\n")
                 if mode == "fixed":
-                    for field in ("output_tokens", "encoder_calls", "decoder_calls", "decoder_row_steps", "max_step_plus_one"):
+                    fields = ("output_tokens",) if args.no_hooks else (
+                        "output_tokens", "encoder_calls", "decoder_calls", "decoder_row_steps", "max_step_plus_one")
+                    for field in fields:
                         if pair[0][field] != pair[1][field]:
                             raise RuntimeError(f"Unequal fixed work for {field}: {pair}")
                 if args.candidate_ablation and pair[0]["output_sha256"] != pair[1]["output_sha256"]:
@@ -240,6 +246,9 @@ def measure_configuration(args, backend, compute, records, controls):
     finally:
         for worker in workers.values():
             worker.close()
+    if args.no_hooks:
+        (out / "uninstrumented-controls.json").write_text("[]\n")
+        return  # All main measurements already run without the probe library.
     # Separate uninstrumented controls check that the hook preserves tokens
     # and expose its timing overhead; do not mix these with phase timings.
     control_mode = "fixed" if "fixed" in args.modes else "natural"
@@ -265,13 +274,15 @@ def run(args):
         for backend in args.backends:
             measure_configuration(args, backend, compute, records, controls)
     summary = []
+    fields = ("wall_ns", "output_tokens", "tokens_per_second") if args.no_hooks else (
+        "wall_ns", "output_tokens", "tokens_per_second", "encoder_ns", "decoder_ns",
+        "other_ns", "decoder_calls", "decoder_row_steps")
     groups = sorted({(r["compute_type"], r["backend"], r["mode"], r["label"]) for r in records})
     for compute, backend, mode, label in groups:
         rows = [r for r in records if (r["compute_type"], r["backend"], r["mode"], r["label"]) == (compute, backend, mode, label)]
-        summary.append(dict(compute_type=compute, backend=backend, mode=mode, label=label, **{
-            key: statistics.median(row[key] for row in rows) for key in (
-                "wall_ns", "output_tokens", "tokens_per_second", "encoder_ns", "decoder_ns",
-                "other_ns", "decoder_calls", "decoder_row_steps")}))
+        summary.append(dict(compute_type=compute, backend=backend, mode=mode, label=label,
+                            timers_enabled=not args.no_hooks, **{
+            key: statistics.median(row[key] for row in rows) for key in fields}))
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
@@ -286,6 +297,8 @@ def main():
     parser.add_argument("--length", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--operators", action="store_true")
+    parser.add_argument("--no-hooks", action="store_true",
+                        help="Measure bare inference without loading the diagnostic probe")
     parser.add_argument("--heap-reuse", action="store_true",
                         help="Diagnostic-only fixed glibc thresholds for reusable heap buffers")
     parser.add_argument("--legacy-allocation", action="store_true",
@@ -301,6 +314,8 @@ def main():
     parser.add_argument("--compute-types", nargs="+", choices=["int8_float32", "float32"],
                         default=["int8_float32", "float32"])
     args = parser.parse_args()
+    if args.no_hooks and (args.operators or args.legacy_allocation or args.candidate_ablation):
+        parser.error("Uninstrumented measurements cannot enable probe controls")
     {"prepare": prepare, "build": build, "run": run, "inspect": inspect}[args.action](args)
 
 
