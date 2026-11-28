@@ -5,6 +5,7 @@ import ctypes
 import hashlib
 import json
 import os
+import resource
 import sys
 import time
 from pathlib import Path
@@ -48,7 +49,8 @@ def main():
                       "compute_type": translator.compute_type,
                       "environment": {k: os.environ.get(k) for k in (
                           "CT2_USE_MKL", "CT2_PACKED_GEMM", "OMP_NUM_THREADS",
-                          "MKL_NUM_THREADS", "CT2_FORCE_CPU_ISA")}}), flush=True)
+                          "MKL_NUM_THREADS", "CT2_FORCE_CPU_ISA",
+                          "MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_")}}), flush=True)
     for line in sys.stdin:
         request = json.loads(line)
         if request.get("stop"):
@@ -60,9 +62,11 @@ def main():
             options.update(min_decoding_length=args.length, end_token=[])
         if timers:
             timers.diag_reset()
+        usage_before = resource.getrusage(resource.RUSAGE_SELF)
         start = time.perf_counter_ns()
         outputs = translator.translate_batch(inputs, **options)
         wall_ns = time.perf_counter_ns() - start
+        usage_after = resource.getrusage(resource.RUSAGE_SELF)
         counts = Counters()
         if timers:
             timers.diag_read(ctypes.byref(counts))
@@ -79,11 +83,18 @@ def main():
                       scores=[r.scores for r in outputs],
                       output_sha256=hashlib.sha256(json.dumps(hypotheses).encode()).hexdigest(),
                       timers_enabled=bool(timers))
+        record["resource_usage"] = dict(
+            minor_faults=usage_after.ru_minflt - usage_before.ru_minflt,
+            major_faults=usage_after.ru_majflt - usage_before.ru_majflt,
+            user_cpu_seconds=usage_after.ru_utime - usage_before.ru_utime,
+            system_cpu_seconds=usage_after.ru_stime - usage_before.ru_stime,
+            voluntary_switches=usage_after.ru_nvcsw - usage_before.ru_nvcsw,
+            involuntary_switches=usage_after.ru_nivcsw - usage_before.ru_nivcsw)
         record.update({name: getattr(counts, name) for name, _ in Counters._fields_})
         if args.operators:
-            values = (ctypes.c_uint64 * 24)()
+            values = (ctypes.c_uint64 * 48)()
             timers.diag_read_operators(values)
-            names = [f"{phase}_{op}_{unit}" for unit in ("ns", "calls")
+            names = [f"{phase}_{op}_{unit}" for unit in ("ns", "calls", "minor_faults", "major_faults")
                      for phase in ("encoder", "decoder")
                      for op in ("dense", "matmul", "softmax", "mask", "concat", "tile")]
             record["operators"] = dict(zip(names, values))

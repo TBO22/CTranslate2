@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <sys/resource.h>
 
 #include <ctranslate2/storage_view.h>
 
@@ -20,6 +21,7 @@ static std::atomic<uint64_t> encoder_calls{0}, decoder_calls{0};
 static std::atomic<uint64_t> decoder_row_steps{0}, max_step_plus_one{0};
 static constexpr int categories = 6;
 static std::atomic<uint64_t> operator_ns[2 * categories]{}, operator_calls[2 * categories]{};
+static std::atomic<uint64_t> operator_minor_faults[2 * categories]{}, operator_major_faults[2 * categories]{};
 static thread_local int active_phase = 0;
 static const bool operators_enabled = std::getenv("CT2_DIAG_OPERATORS") != nullptr;
 
@@ -53,6 +55,8 @@ extern "C" void diag_reset() {
   for (int i = 0; i < 2 * categories; ++i) {
     operator_ns[i] = 0;
     operator_calls[i] = 0;
+    operator_minor_faults[i] = 0;
+    operator_major_faults[i] = 0;
   }
 }
 
@@ -60,6 +64,8 @@ extern "C" void diag_read_operators(uint64_t* result) {
   for (int i = 0; i < 2 * categories; ++i) {
     result[i] = operator_ns[i].load();
     result[i + 2 * categories] = operator_calls[i].load();
+    result[i + 4 * categories] = operator_minor_faults[i].load();
+    result[i + 6 * categories] = operator_major_faults[i].load();
   }
 }
 
@@ -79,9 +85,14 @@ template <typename Function> static void time_operator(int category, Function ca
     return;
   }
   const int index = (active_phase - 1) * categories + category;
+  rusage before{}, after{};
+  if (getrusage(RUSAGE_SELF, &before) != 0) std::abort();
   const auto start = Clock::now();
   call();
   operator_ns[index] += elapsed(start);
+  if (getrusage(RUSAGE_SELF, &after) != 0) std::abort();
+  operator_minor_faults[index] += static_cast<uint64_t>(after.ru_minflt - before.ru_minflt);
+  operator_major_faults[index] += static_cast<uint64_t>(after.ru_majflt - before.ru_majflt);
   ++operator_calls[index];
 }
 

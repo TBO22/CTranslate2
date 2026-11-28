@@ -36,6 +36,10 @@ on:
         type: choice
         options: ['1', '3', '6']
         default: '3'
+      heap_reuse:
+        type: boolean
+        default: false
+        description: Diagnostic-only allocator control; does not change system settings
 
 permissions:
   contents: read
@@ -62,6 +66,7 @@ jobs:
       DIAG_PRECISION: ${{ inputs.precision }}
       DIAG_OPERATORS: ${{ inputs.operators }}
       DIAG_REPEATS: ${{ inputs.repeats }}
+      DIAG_HEAP_REUSE: ${{ inputs.heap_reuse }}
     steps:
       - uses: actions/checkout@v5
       - name: Record hardware and enforce qualification requirement
@@ -130,6 +135,7 @@ jobs:
             *) exit 1 ;;
           esac
           if [ "$DIAG_OPERATORS" = true ]; then args+=(--operators); fi
+          if [ "$DIAG_HEAP_REUSE" = true ]; then args+=(--heap-reuse); fi
           python diagnose.py run "${args[@]}" | tee results/measurements.jsonl
       - uses: actions/upload-artifact@v4
         if: always()

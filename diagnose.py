@@ -99,6 +99,8 @@ class Worker:
                    CT2_PACKED_GEMM="1" if backend == "mkl-packed" else "0",
                    CT2_VERBOSE="1", OMP_NUM_THREADS="2", MKL_NUM_THREADS="2",
                    OPENBLAS_NUM_THREADS="2", TOKENIZERS_PARALLELISM="false")
+        if args.heap_reuse:
+            env.update(MALLOC_MMAP_THRESHOLD_="268435456", MALLOC_TRIM_THRESHOLD_="268435456")
         command = [python, "-u", str(HERE / "worker.py"), "--model", str(out / "model"),
                    "--inputs", str(out / "inputs.json"), "--length", str(args.length),
                    "--compute-type", compute]
@@ -215,6 +217,8 @@ def main():
     parser.add_argument("--length", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--operators", action="store_true")
+    parser.add_argument("--heap-reuse", action="store_true",
+                        help="Diagnostic-only fixed glibc thresholds for reusable heap buffers")
     parser.add_argument("--backends", nargs="+", choices=["mkl-packed", "mkl-unpacked", "dnnl"],
                         default=["mkl-packed", "mkl-unpacked", "dnnl"])
     parser.add_argument("--modes", nargs="+", choices=["natural", "fixed"],
