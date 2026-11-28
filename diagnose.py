@@ -142,12 +142,13 @@ class Worker:
                    "--inputs", str(out / "inputs.json"), "--length", str(args.length),
                    "--compute-type", compute]
         if hooks:
-            env.update(LD_PRELOAD=str(out / "timing_hooks.so"), CT2_DIAG_LIBRARY=libs[label])
+            library_label = "candidate" if args.candidate_ablation else label
+            env.update(LD_PRELOAD=str(out / "timing_hooks.so"), CT2_DIAG_LIBRARY=libs[library_label])
             command += ["--timers", str(out / "timing_hooks.so")]
             if args.operators:
                 env["CT2_DIAG_OPERATORS"] = "1"
                 command += ["--operators"]
-            if args.legacy_allocation and label == "candidate":
+            if (args.legacy_allocation or args.candidate_ablation) and label == "candidate":
                 env["CT2_DIAG_LEGACY_ALLOCATION"] = "1"
         self.log_path = out / f"{backend}-{compute}-{label}-hooks{int(hooks)}.log"
         self.log = open(self.log_path, "w")
@@ -186,8 +187,10 @@ class Worker:
 def measure_configuration(args, backend, compute, records, controls):
     out = Path(args.out).resolve()
     workers = {}
+    baseline_python = args.candidate_python if args.candidate_ablation else args.baseline_python
+    runtimes = (("baseline", baseline_python), ("candidate", args.candidate_python))
     try:
-        for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
+        for label, python in runtimes:
             workers[label] = Worker(python, label, backend, args, compute=compute)
             for mode in args.modes:
                 workers[label].measure(mode, -1)
@@ -196,7 +199,8 @@ def measure_configuration(args, backend, compute, records, controls):
                 order = ("baseline", "candidate") if repeat % 2 == 0 else ("candidate", "baseline")
                 pair = []
                 for label in order:
-                    record = dict(workers[label].measure(mode, repeat), backend=backend)
+                    record = dict(workers[label].measure(mode, repeat), backend=backend,
+                                  comparison="candidate allocation on/off" if args.candidate_ablation else "4.9.1 vs reported PR")
                     records.append(record)
                     pair.append(record)
                     if args.operators and label == "candidate" and not record["operators"]["decoder_mask_calls"]:
@@ -207,13 +211,15 @@ def measure_configuration(args, backend, compute, records, controls):
                     for field in ("output_tokens", "encoder_calls", "decoder_calls", "decoder_row_steps", "max_step_plus_one"):
                         if pair[0][field] != pair[1][field]:
                             raise RuntimeError(f"Unequal fixed work for {field}: {pair}")
+                if args.candidate_ablation and pair[0]["output_sha256"] != pair[1]["output_sha256"]:
+                    raise RuntimeError("Allocation-only ablation changed token outputs")
     finally:
         for worker in workers.values():
             worker.close()
     # Separate uninstrumented controls check that the hook preserves tokens
     # and expose its timing overhead; do not mix these with phase timings.
     control_mode = "fixed" if "fixed" in args.modes else "natural"
-    for label, python in (("baseline", args.baseline_python), ("candidate", args.candidate_python)):
+    for label, python in runtimes:
         worker = Worker(python, label, backend, args, hooks=False, compute=compute)
         try:
             worker.measure(control_mode, -1)
@@ -260,6 +266,8 @@ def main():
                         help="Diagnostic-only fixed glibc thresholds for reusable heap buffers")
     parser.add_argument("--legacy-allocation", action="store_true",
                         help="Candidate-only ablation restoring the removed length-buffer lifetime")
+    parser.add_argument("--candidate-ablation", action="store_true",
+                        help="Use the candidate binary for both labels; toggle only the legacy allocation")
     parser.add_argument("--backends", nargs="+", choices=["mkl-packed", "mkl-unpacked", "dnnl"],
                         default=["mkl-packed", "mkl-unpacked", "dnnl"])
     parser.add_argument("--modes", nargs="+", choices=["natural", "fixed"],

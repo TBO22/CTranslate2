@@ -38,7 +38,7 @@ on:
         default: '3'
       heap_reuse:
         type: choice
-        options: ['false', 'true', 'legacy-allocation']
+        options: ['false', 'true', 'legacy-allocation', 'candidate-ablation']
         default: 'false'
         description: Diagnostic allocator control; legacy-allocation changes no numerical work
       provenance_only:
@@ -151,6 +151,7 @@ jobs:
           if [ "$DIAG_OPERATORS" = true ]; then args+=(--operators); fi
           if [ "$DIAG_HEAP_REUSE" = true ]; then args+=(--heap-reuse); fi
           if [ "$DIAG_HEAP_REUSE" = legacy-allocation ]; then args+=(--legacy-allocation); fi
+          if [ "$DIAG_HEAP_REUSE" = candidate-ablation ]; then args+=(--candidate-ablation); fi
           python diagnose.py run "${args[@]}" | tee results/measurements.jsonl
       - uses: actions/upload-artifact@v4
         if: always()
