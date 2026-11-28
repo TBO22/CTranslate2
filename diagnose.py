@@ -55,6 +55,8 @@ def symbols(path):
                 "DECODER_SYMBOL": "ctranslate2::layers::TransformerDecoder::decode(",
                 "DENSE_SYMBOL": "ctranslate2::layers::Dense::operator()(",
                 "MATMUL_SYMBOL": "ctranslate2::ops::MatMul::operator()(",
+                "CONCAT_SYMBOL": "ctranslate2::ops::Concat::operator()(",
+                "TILE_SYMBOL": "ctranslate2::ops::Tile::operator()(ctranslate2::StorageView const&,",
                 "SOFTMAX_SYMBOL": "ctranslate2::ops::SoftMax::operator()(ctranslate2::StorageView const&, ctranslate2::StorageView const*,",
                 "MASK_SYMBOL": "void ctranslate2::primitives<(ctranslate2::Device)0>::mask_merged_attention<float>("}
     result = {}

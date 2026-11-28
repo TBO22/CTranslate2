@@ -81,11 +81,11 @@ def main():
                       timers_enabled=bool(timers))
         record.update({name: getattr(counts, name) for name, _ in Counters._fields_})
         if args.operators:
-            values = (ctypes.c_uint64 * 16)()
+            values = (ctypes.c_uint64 * 24)()
             timers.diag_read_operators(values)
             names = [f"{phase}_{op}_{unit}" for unit in ("ns", "calls")
                      for phase in ("encoder", "decoder")
-                     for op in ("dense", "matmul", "softmax", "mask")]
+                     for op in ("dense", "matmul", "softmax", "mask", "concat", "tile")]
             record["operators"] = dict(zip(names, values))
             for op in ("dense", "matmul", "softmax"):
                 if not record["operators"][f"decoder_{op}_calls"]:
