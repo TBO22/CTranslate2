@@ -30,6 +30,21 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - uses: actions/checkout@v5
+        with:
+          repository: OpenNMT/CTranslate2
+          ref: '40f8e6a1410489dfeeedd8f9133992177be33e9e'
+          path: ct2-headers
+      - uses: actions/checkout@v5
+        with:
+          repository: OpenNMT/CTranslate2
+          ref: v4.9.1
+          path: base-headers
+      - name: Verify the read-only StorageView layout
+        run: |
+          cmp base-headers/include/ctranslate2/storage_view.h ct2-headers/include/ctranslate2/storage_view.h
+          cmp base-headers/include/ctranslate2/types.h ct2-headers/include/ctranslate2/types.h
+          sha256sum ct2-headers/include/ctranslate2/storage_view.h > results/storage-view-header-sha256.txt
       - name: Download exact candidate wheels from the reported run
         run: |
           gh run download 45992420951 --repo OpenNMT/CTranslate2 --name python-wheels-Linux-auto64 --dir wheels
@@ -48,7 +63,7 @@ jobs:
       - name: Prepare one shared FP32 model and gate prompts
         run: baseline/bin/python diagnose.py prepare --out "$PWD/results" --limit 8
       - name: Build and verify Linux phase hooks
-        run: python diagnose.py build --out "$PWD/results" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python"
+        run: python diagnose.py build --out "$PWD/results" --headers "$PWD/ct2-headers" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python"
       - name: Alternate base and PR under all three backends
         run: python diagnose.py run --out "$PWD/results" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python" --length 64 --repeats 3 | tee results/measurements.jsonl
       - uses: actions/upload-artifact@v4
