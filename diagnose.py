@@ -52,8 +52,7 @@ def symbols(path):
     names = [line.split()[-1] for line in raw.splitlines() if len(line.split()) >= 3]
     decoded = subprocess.check_output(["c++filt"], input="\n".join(names), text=True).splitlines()
     prefixes = {"ENCODER_SYMBOL": "ctranslate2::layers::TransformerEncoder::operator()(std::vector<",
-                "DECODER_SYMBOL": "ctranslate2::layers::TransformerDecoder::decode(",
-                "DIM_SYMBOL": "ctranslate2::StorageView::dim("}
+                "DECODER_SYMBOL": "ctranslate2::layers::TransformerDecoder::decode("}
     result = {}
     for key, prefix in prefixes.items():
         matches = [name for name, display in zip(names, decoded) if display.startswith(prefix)]
@@ -73,6 +72,7 @@ def build(args):
     (out / "symbols.h").write_text("".join(f'#define {key} "{value}"\n' for key, value in base.items()))
     hook = out / "timing_hooks.so"
     subprocess.check_call(["g++", "-O2", "-std=c++17", "-fPIC", "-shared", "-I", str(out),
+                           "-I", str(Path(args.headers).resolve() / "include"),
                            str(HERE / "timing_hooks.cc"), "-ldl", "-o", str(hook)])
     exported = subprocess.check_output(["nm", "-D", "--defined-only", str(hook)], text=True)
     for key in ("ENCODER_SYMBOL", "DECODER_SYMBOL"):
@@ -183,6 +183,7 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--baseline-python")
     parser.add_argument("--candidate-python")
+    parser.add_argument("--headers")
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--length", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)

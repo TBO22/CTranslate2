@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <dlfcn.h>
 
+#include <ctranslate2/storage_view.h>
+
 #include "symbols.h"
 
 struct Counters {
@@ -69,10 +71,8 @@ extern "C" void decoder_hook(void* self, const void* ids, const void* lengths,
                               int64_t step, void* state, void* output,
                               void* attention, bool return_logits) {
   using Function = void (*)(void*, const void*, const void*, int64_t, void*, void*, void*, bool);
-  using Dimension = int64_t (*)(const void*, int64_t);
   static const Function call = original<Function>(DECODER_SYMBOL);
-  static const Dimension dimension = original<Dimension>(DIM_SYMBOL);
-  const uint64_t rows = dimension(ids, 0);
+  const uint64_t rows = static_cast<const ctranslate2::StorageView*>(ids)->dim(0);
   const auto start = Clock::now();
   call(self, ids, lengths, step, state, output, attention, return_logits);
   decoder_ns += elapsed(start);
