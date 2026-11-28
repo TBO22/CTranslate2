@@ -82,10 +82,21 @@ identical token output, restoring the removed length-buffer allocation improved
 median fixed-work throughput by 12.89% over six paired requests. Tile minor
 faults fell from about 5.71 million to 2.94 million. One late allocation-off
 request became fast, so allocation history and raw variability remain relevant.
-This diagnostic allocation is not a production fix. A separate production
-candidate restores useful CPU length-aware softmax while retaining explicit
-causal/window masking. Its exact wheel requires fresh-process, full-selection
-Intel qualification before the regression can be considered resolved.
+This diagnostic allocation is not a production fix. The first production
+candidate restored useful CPU length-aware softmax but failed repeated bare
+qualification: natural throughput was 56.814 versus 45.146 tokens/s (-20.54%)
+against 4.9.1. Against the unpatched masking runtime it changed fixed throughput
+by -0.25% and natural throughput by -1.86%. The profiled natural result went in
+the opposite direction; do not use it as a production improvement claim.
+
+That candidate is retained on `fix/t5gemma-cpu-attention-throughput` for
+reproducibility and was not pushed to PR #2175. The replacement candidate,
+`fix/t5gemma-cpu-kv-merge` at `ae6f3ccf`, copies encoder memory directly into
+the final merged CPU beam buffer, avoiding the intermediate Tile allocation
+and duplicate copy. Masks and softmax are unchanged. CPU, Metal and focused
+Python tests pass; 42 small-model FP32/INT8 requests match unpatched tokens,
+logits and scores bit for bit. Its exact standard wheel and repeated bare
+Intel inference still require qualification. No speedup is claimed yet.
 The standalone 50-example natural-stopping run and focused profiles completed;
 the initial full backend matrices were interrupted deliberately to save partial
 results before timeout and must not be reported as completed CI qualification.
