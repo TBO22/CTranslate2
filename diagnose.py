@@ -121,6 +121,8 @@ def build(args):
                            str(HERE / "timing_hooks.cc"), "-ldl", "-o", str(hook)])
     exported = subprocess.check_output(["nm", "-D", "--defined-only", str(hook)], text=True)
     for key, value in candidate.items():
+        if key == "ALLOCATOR_SYMBOL":
+            continue  # Looked up in CT2; deliberately not interposed by the probe.
         if value not in exported:
             raise RuntimeError(f"Hook does not export the exact {key}")
     (out / "libraries.json").write_text(json.dumps(libs, indent=2) + "\n")
