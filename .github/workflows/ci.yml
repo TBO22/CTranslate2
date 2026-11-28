@@ -18,7 +18,7 @@ on:
         description: Number of examples from the pinned release-gate selection
       backend:
         type: choice
-        options: [all, mkl-packed]
+        options: [all, mkl-packed, mkl-unpacked, dnnl]
         default: all
       mode:
         type: choice
@@ -28,6 +28,14 @@ on:
         type: choice
         options: [both, int8_float32, float32]
         default: both
+      operators:
+        type: boolean
+        default: false
+        description: Time Dense, MatMul, softmax and mask calls inside each phase
+      repeats:
+        type: choice
+        options: ['3', '6']
+        default: '3'
 
 permissions:
   contents: read
@@ -52,6 +60,8 @@ jobs:
       DIAG_BACKEND: ${{ inputs.backend }}
       DIAG_MODE: ${{ inputs.mode }}
       DIAG_PRECISION: ${{ inputs.precision }}
+      DIAG_OPERATORS: ${{ inputs.operators }}
+      DIAG_REPEATS: ${{ inputs.repeats }}
     steps:
       - uses: actions/checkout@v5
       - name: Record hardware and enforce qualification requirement
@@ -103,10 +113,10 @@ jobs:
         run: python diagnose.py build --out "$PWD/results" --headers "$PWD/ct2-headers" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python"
       - name: Alternate base and PR under requested backends
         run: |
-          args=(--out "$PWD/results" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python" --length 64 --repeats 3)
+          args=(--out "$PWD/results" --baseline-python "$PWD/baseline/bin/python" --candidate-python "$PWD/candidate/bin/python" --length 64 --repeats "$DIAG_REPEATS")
           case "$DIAG_BACKEND" in
             all) ;;
-            mkl-packed) args+=(--backends mkl-packed) ;;
+            mkl-packed|mkl-unpacked|dnnl) args+=(--backends "$DIAG_BACKEND") ;;
             *) exit 1 ;;
           esac
           case "$DIAG_MODE" in
@@ -119,6 +129,7 @@ jobs:
             int8_float32|float32) args+=(--compute-types "$DIAG_PRECISION") ;;
             *) exit 1 ;;
           esac
+          if [ "$DIAG_OPERATORS" = true ]; then args+=(--operators); fi
           python diagnose.py run "${args[@]}" | tee results/measurements.jsonl
       - uses: actions/upload-artifact@v4
         if: always()

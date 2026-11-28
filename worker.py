@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--inputs", required=True)
     parser.add_argument("--compute-type", default="int8_float32")
     parser.add_argument("--timers")
+    parser.add_argument("--operators", action="store_true")
     parser.add_argument("--length", type=int, default=64)
     args = parser.parse_args()
     timers = ctypes.CDLL(args.timers) if args.timers else None
@@ -33,6 +34,9 @@ def main():
         timers.diag_read.restype = None
         timers.diag_reset.argtypes = []
         timers.diag_reset.restype = None
+        if args.operators:
+            timers.diag_read_operators.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+            timers.diag_read_operators.restype = None
     inputs = json.loads(Path(args.inputs).read_text())["tokens"]
     translator = ctranslate2.Translator(
         args.model, device="cpu", compute_type=args.compute_type,
@@ -76,6 +80,16 @@ def main():
                       output_sha256=hashlib.sha256(json.dumps(hypotheses).encode()).hexdigest(),
                       timers_enabled=bool(timers))
         record.update({name: getattr(counts, name) for name, _ in Counters._fields_})
+        if args.operators:
+            values = (ctypes.c_uint64 * 16)()
+            timers.diag_read_operators(values)
+            names = [f"{phase}_{op}_{unit}" for unit in ("ns", "calls")
+                     for phase in ("encoder", "decoder")
+                     for op in ("dense", "matmul", "softmax", "mask")]
+            record["operators"] = dict(zip(names, values))
+            for op in ("dense", "matmul", "softmax"):
+                if not record["operators"][f"decoder_{op}_calls"]:
+                    raise RuntimeError(f"The decoder {op} hook did not intercept CT2")
         if timers:
             record["other_ns"] = wall_ns - counts.encoder_ns - counts.decoder_ns
             if record["other_ns"] < 0:

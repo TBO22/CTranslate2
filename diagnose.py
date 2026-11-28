@@ -52,10 +52,16 @@ def symbols(path):
     names = [line.split()[-1] for line in raw.splitlines() if len(line.split()) >= 3]
     decoded = subprocess.check_output(["c++filt"], input="\n".join(names), text=True).splitlines()
     prefixes = {"ENCODER_SYMBOL": "ctranslate2::layers::TransformerEncoder::operator()(std::vector<",
-                "DECODER_SYMBOL": "ctranslate2::layers::TransformerDecoder::decode("}
+                "DECODER_SYMBOL": "ctranslate2::layers::TransformerDecoder::decode(",
+                "DENSE_SYMBOL": "ctranslate2::layers::Dense::operator()(",
+                "MATMUL_SYMBOL": "ctranslate2::ops::MatMul::operator()(",
+                "SOFTMAX_SYMBOL": "ctranslate2::ops::SoftMax::operator()(ctranslate2::StorageView const&, ctranslate2::StorageView const*,",
+                "MASK_SYMBOL": "void ctranslate2::primitives<(ctranslate2::Device)0>::mask_merged_attention<float>("}
     result = {}
     for key, prefix in prefixes.items():
         matches = [name for name, display in zip(names, decoded) if display.startswith(prefix)]
+        if key == "MASK_SYMBOL" and not matches:
+            continue  # The released baseline predates this primitive.
         if len(matches) != 1:
             raise RuntimeError(f"Expected one {key} in {path}, got {matches}")
         result[key] = matches[0]
@@ -67,16 +73,18 @@ def build(args):
     out.mkdir(parents=True, exist_ok=True)
     libs = {"baseline": library(args.baseline_python), "candidate": library(args.candidate_python)}
     base, candidate = symbols(libs["baseline"]), symbols(libs["candidate"])
-    if base != candidate:
+    if any(candidate.get(key) != value for key, value in base.items()):
         raise RuntimeError("Phase-hook ABI differs between these wheels")
-    (out / "symbols.h").write_text("".join(f'#define {key} "{value}"\n' for key, value in base.items()))
+    if "MASK_SYMBOL" not in candidate:
+        raise RuntimeError("Candidate CPU mask symbol is missing")
+    (out / "symbols.h").write_text("".join(f'#define {key} "{value}"\n' for key, value in candidate.items()))
     hook = out / "timing_hooks.so"
     subprocess.check_call(["g++", "-O2", "-std=c++17", "-fPIC", "-shared", "-I", str(out),
                            "-I", str(Path(args.headers).resolve() / "include"),
                            str(HERE / "timing_hooks.cc"), "-ldl", "-o", str(hook)])
     exported = subprocess.check_output(["nm", "-D", "--defined-only", str(hook)], text=True)
-    for key in ("ENCODER_SYMBOL", "DECODER_SYMBOL"):
-        if base[key] not in exported:
+    for key, value in candidate.items():
+        if value not in exported:
             raise RuntimeError(f"Hook does not export the exact {key}")
     (out / "libraries.json").write_text(json.dumps(libs, indent=2) + "\n")
 
@@ -95,6 +103,9 @@ class Worker:
         if hooks:
             env.update(LD_PRELOAD=str(out / "timing_hooks.so"), CT2_DIAG_LIBRARY=libs[label])
             command += ["--timers", str(out / "timing_hooks.so")]
+            if args.operators:
+                env["CT2_DIAG_OPERATORS"] = "1"
+                command += ["--operators"]
         self.log_path = out / f"{backend}-{compute}-{label}-hooks{int(hooks)}.log"
         self.log = open(self.log_path, "w")
         self.process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
@@ -145,6 +156,8 @@ def measure_configuration(args, backend, compute, records, controls):
                     record = dict(workers[label].measure(mode, repeat), backend=backend)
                     records.append(record)
                     pair.append(record)
+                    if args.operators and label == "candidate" and not record["operators"]["decoder_mask_calls"]:
+                        raise RuntimeError("Candidate mask hook did not intercept the decoder")
                     print(json.dumps({k: v for k, v in record.items() if k not in ("hypotheses", "scores")}), flush=True)
                     (out / "measurements.json").write_text(json.dumps(records, indent=2) + "\n")
                 if mode == "fixed":
@@ -199,6 +212,7 @@ def main():
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--length", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--operators", action="store_true")
     parser.add_argument("--backends", nargs="+", choices=["mkl-packed", "mkl-unpacked", "dnnl"],
                         default=["mkl-packed", "mkl-unpacked", "dnnl"])
     parser.add_argument("--modes", nargs="+", choices=["natural", "fixed"],
