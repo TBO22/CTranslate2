@@ -37,9 +37,10 @@ on:
         options: ['1', '3', '6']
         default: '3'
       heap_reuse:
-        type: boolean
-        default: false
-        description: Diagnostic-only allocator control; does not change system settings
+        type: choice
+        options: ['false', 'true', 'legacy-allocation']
+        default: 'false'
+        description: Diagnostic allocator control; legacy-allocation changes no numerical work
       provenance_only:
         type: boolean
         default: false
@@ -101,6 +102,7 @@ jobs:
         run: |
           cmp base-headers/include/ctranslate2/storage_view.h ct2-headers/include/ctranslate2/storage_view.h
           cmp base-headers/include/ctranslate2/types.h ct2-headers/include/ctranslate2/types.h
+          cmp base-headers/include/ctranslate2/allocator.h ct2-headers/include/ctranslate2/allocator.h
           sha256sum ct2-headers/include/ctranslate2/storage_view.h > results/storage-view-header-sha256.txt
       - name: Download exact candidate wheels from the reported run
         run: |
@@ -148,6 +150,7 @@ jobs:
           esac
           if [ "$DIAG_OPERATORS" = true ]; then args+=(--operators); fi
           if [ "$DIAG_HEAP_REUSE" = true ]; then args+=(--heap-reuse); fi
+          if [ "$DIAG_HEAP_REUSE" = legacy-allocation ]; then args+=(--legacy-allocation); fi
           python diagnose.py run "${args[@]}" | tee results/measurements.jsonl
       - uses: actions/upload-artifact@v4
         if: always()

@@ -57,6 +57,8 @@ def symbols(path):
                 "MATMUL_SYMBOL": "ctranslate2::ops::MatMul::operator()(",
                 "CONCAT_SYMBOL": "ctranslate2::ops::Concat::operator()(",
                 "TILE_SYMBOL": "ctranslate2::ops::Tile::operator()(ctranslate2::StorageView const&,",
+                "MERGED_SYMBOL": "ctranslate2::layers::MultiHeadAttention::forward_merged(",
+                "ALLOCATOR_SYMBOL": "ctranslate2::get_allocator(ctranslate2::Device)",
                 "SOFTMAX_SYMBOL": "ctranslate2::ops::SoftMax::operator()(ctranslate2::StorageView const&, ctranslate2::StorageView const*,",
                 "MASK_SYMBOL": "void ctranslate2::primitives<(ctranslate2::Device)0>::mask_merged_attention<float>("}
     result = {}
@@ -143,6 +145,8 @@ class Worker:
             if args.operators:
                 env["CT2_DIAG_OPERATORS"] = "1"
                 command += ["--operators"]
+            if args.legacy_allocation and label == "candidate":
+                env["CT2_DIAG_LEGACY_ALLOCATION"] = "1"
         self.log_path = out / f"{backend}-{compute}-{label}-hooks{int(hooks)}.log"
         self.log = open(self.log_path, "w")
         self.process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
@@ -252,6 +256,8 @@ def main():
     parser.add_argument("--operators", action="store_true")
     parser.add_argument("--heap-reuse", action="store_true",
                         help="Diagnostic-only fixed glibc thresholds for reusable heap buffers")
+    parser.add_argument("--legacy-allocation", action="store_true",
+                        help="Candidate-only ablation restoring the removed length-buffer lifetime")
     parser.add_argument("--backends", nargs="+", choices=["mkl-packed", "mkl-unpacked", "dnnl"],
                         default=["mkl-packed", "mkl-unpacked", "dnnl"])
     parser.add_argument("--modes", nargs="+", choices=["natural", "fixed"],

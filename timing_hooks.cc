@@ -6,8 +6,11 @@
 #include <cstdlib>
 #include <dlfcn.h>
 #include <sys/resource.h>
+#include <algorithm>
+#include <limits>
 
 #include <ctranslate2/storage_view.h>
+#include <ctranslate2/allocator.h>
 
 #include "symbols.h"
 
@@ -24,6 +27,24 @@ static std::atomic<uint64_t> operator_ns[2 * categories]{}, operator_calls[2 * c
 static std::atomic<uint64_t> operator_minor_faults[2 * categories]{}, operator_major_faults[2 * categories]{};
 static thread_local int active_phase = 0;
 static const bool operators_enabled = std::getenv("CT2_DIAG_OPERATORS") != nullptr;
+static const bool legacy_allocation = std::getenv("CT2_DIAG_LEGACY_ALLOCATION") != nullptr;
+
+struct LegacyScratch;
+static thread_local LegacyScratch* current_merged = nullptr;
+
+struct LegacyScratch {
+  LegacyScratch* previous;
+  int64_t rows;
+  ctranslate2::Allocator* allocator = nullptr;
+  void* data = nullptr;
+  explicit LegacyScratch(int64_t count) : previous(current_merged), rows(count) {
+    current_merged = this;
+  }
+  ~LegacyScratch() {
+    if (data) allocator->free(data, -1);
+    current_merged = previous;
+  }
+};
 
 struct Phase {
   int previous;
@@ -140,7 +161,41 @@ extern "C" void matmul_hook(void*, const void*, const void*, void*) asm(MATMUL_S
 extern "C" void matmul_hook(void* self, const void* a, const void* b, void* c) {
   using Function = void (*)(void*, const void*, const void*, void*);
   static const Function call = original<Function>(MATMUL_SYMBOL);
+  // The old full-coverage length tensor was allocated immediately before QK
+  // and freed after forward_merged's other temporaries. Restore ONLY that
+  // allocation/fill/lifetime, without changing scores, softmax or any output.
+  if (current_merged && !current_merged->data) {
+    const auto depth = static_cast<const ctranslate2::StorageView*>(b)->dim(-2);
+    if (current_merged->rows <= 0 || depth > std::numeric_limits<int32_t>::max()) std::abort();
+    using GetAllocator = ctranslate2::Allocator& (*)(ctranslate2::Device);
+    static const GetAllocator get = original<GetAllocator>(ALLOCATOR_SYMBOL);
+    auto& allocator = get(ctranslate2::Device::CPU);
+    current_merged->allocator = &allocator;
+    current_merged->data = allocator.allocate(current_merged->rows * sizeof(int32_t), -1);
+    auto* lengths = static_cast<int32_t*>(current_merged->data);
+    std::fill(lengths, lengths + current_merged->rows, static_cast<int32_t>(depth));
+  }
   time_operator(1, [&] { call(self, a, b, c); });
+}
+
+extern "C" void merged_hook(void*, const void*, const void*, const void*, const void*,
+    void*, void*, void*, void*, void*, const void*, const void*, int64_t) asm(MERGED_SYMBOL);
+extern "C" void merged_hook(void* self, const void* queries, const void* memory,
+    const void* memory_lengths, const void* self_lengths, void* output,
+    void* self_keys, void* self_values, void* memory_keys, void* memory_values,
+    const void* queries_padder, const void* memory_padder, int64_t offset) {
+  using Function = void (*)(void*, const void*, const void*, const void*, const void*,
+      void*, void*, void*, void*, void*, const void*, const void*, int64_t);
+  static const Function call = original<Function>(MERGED_SYMBOL);
+  auto forward = [&] { call(self, queries, memory, memory_lengths, self_lengths, output,
+      self_keys, self_values, memory_keys, memory_values, queries_padder, memory_padder, offset); };
+  if (legacy_allocation && memory_lengths) {
+    LegacyScratch scratch(static_cast<const ctranslate2::StorageView*>(memory_lengths)->size());
+    forward();
+    if (!scratch.data) std::abort();
+  } else {
+    forward();
+  }
 }
 
 extern "C" void softmax_hook(void*, const void*, const void*, void*) asm(SOFTMAX_SYMBOL);

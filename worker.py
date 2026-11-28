@@ -45,12 +45,14 @@ def main():
     )
     if translator.compute_type != args.compute_type:
         raise RuntimeError(f"Unexpected compute type: {translator.compute_type}")
-    print(json.dumps({"ready": True, "version": ctranslate2.__version__,
-                      "compute_type": translator.compute_type,
-                      "environment": {k: os.environ.get(k) for k in (
+    worker_environment = {k: os.environ.get(k) for k in (
                           "CT2_USE_MKL", "CT2_PACKED_GEMM", "OMP_NUM_THREADS",
                           "MKL_NUM_THREADS", "CT2_FORCE_CPU_ISA",
-                          "MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_")}}), flush=True)
+                          "MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_",
+                          "CT2_DIAG_LEGACY_ALLOCATION")}
+    print(json.dumps({"ready": True, "version": ctranslate2.__version__,
+                      "compute_type": translator.compute_type,
+                      "environment": worker_environment}), flush=True)
     for line in sys.stdin:
         request = json.loads(line)
         if request.get("stop"):
@@ -77,7 +79,7 @@ def main():
         if fixed and lengths != [args.length] * len(inputs):
             raise RuntimeError(f"Fixed-length contract violated: {lengths}")
         tokens = sum(lengths)
-        record = dict(request, wall_ns=wall_ns, output_tokens=tokens,
+        record = dict(request, environment=worker_environment, wall_ns=wall_ns, output_tokens=tokens,
                       tokens_per_second=tokens * 1e9 / wall_ns,
                       output_lengths=lengths, hypotheses=hypotheses,
                       scores=[r.scores for r in outputs],
